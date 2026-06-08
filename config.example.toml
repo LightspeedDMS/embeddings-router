@@ -1,0 +1,22 @@
+[server]
+bind = "127.0.0.1:3200"
+
+[multiplexer]
+batch_window_ms = 50
+channel_capacity = 1024
+
+[retry]
+max_retries = 2
+per_attempt_cap_ms = 15000
+cumulative_cap_ms = 45000
+
+[health]
+rolling_window_minutes = 60
+
+[database]
+path = "~/.config/emr/emr.db"
+
+[admin]
+# Admin secret is read from the EMR_ADMIN_SECRET environment variable.
+# Required for CLI management operations against a running server.
+# Set it with: export EMR_ADMIN_SECRET=<your-secret>

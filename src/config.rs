@@ -1,0 +1,572 @@
+use serde::Deserialize;
+use std::path::Path;
+use toml::Value;
+
+use crate::error::ConfigError;
+
+// ── Default value helpers ────────────────────────────────────────────────────
+
+fn default_bind() -> String {
+    "127.0.0.1:3200".to_string()
+}
+
+fn default_batch_window_ms() -> u64 {
+    50
+}
+
+fn default_channel_capacity() -> usize {
+    1024
+}
+
+fn default_max_retries() -> u32 {
+    2
+}
+
+fn default_per_attempt_cap_ms() -> u64 {
+    15000
+}
+
+fn default_cumulative_cap_ms() -> u64 {
+    45000
+}
+
+fn default_rolling_window_minutes() -> u64 {
+    60
+}
+
+fn default_db_path() -> String {
+    "~/.config/emr/emr.db".to_string()
+}
+
+// ── Config structs ───────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ServerConfig {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MultiplexerConfig {
+    #[serde(default = "default_batch_window_ms")]
+    pub batch_window_ms: u64,
+    #[serde(default = "default_channel_capacity")]
+    pub channel_capacity: usize,
+}
+
+impl Default for MultiplexerConfig {
+    fn default() -> Self {
+        Self {
+            batch_window_ms: default_batch_window_ms(),
+            channel_capacity: default_channel_capacity(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RetryConfig {
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+    #[serde(default = "default_per_attempt_cap_ms")]
+    pub per_attempt_cap_ms: u64,
+    #[serde(default = "default_cumulative_cap_ms")]
+    pub cumulative_cap_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            per_attempt_cap_ms: default_per_attempt_cap_ms(),
+            cumulative_cap_ms: default_cumulative_cap_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HealthConfig {
+    #[serde(default = "default_rolling_window_minutes")]
+    pub rolling_window_minutes: u64,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            rolling_window_minutes: default_rolling_window_minutes(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_path")]
+    pub path: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+        }
+    }
+}
+
+/// Admin config section. The actual secret is read from the EMR_ADMIN_SECRET
+/// environment variable at runtime — it is never stored in the config file.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminConfig {
+    // Intentionally empty: admin secret is sourced from EMR_ADMIN_SECRET env var only.
+    // This section exists in TOML for documentation purposes.
+    #[serde(skip)]
+    _placeholder: (),
+}
+
+/// Top-level configuration structure.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct Config {
+    #[serde(default)]
+    pub server: ServerConfig,
+    #[serde(default)]
+    pub multiplexer: MultiplexerConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub health: HealthConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub admin: AdminConfig,
+}
+
+// ── Config TOML template ─────────────────────────────────────────────────────
+
+/// Returns the default config as a documented TOML string.
+pub fn default_config_toml() -> String {
+    format!(
+        r#"[server]
+bind = "{bind}"
+
+[multiplexer]
+batch_window_ms = {batch_window_ms}
+channel_capacity = {channel_capacity}
+
+[retry]
+max_retries = {max_retries}
+per_attempt_cap_ms = {per_attempt_cap_ms}
+cumulative_cap_ms = {cumulative_cap_ms}
+
+[health]
+rolling_window_minutes = {rolling_window_minutes}
+
+[database]
+path = "{db_path}"
+
+[admin]
+# Admin secret is read from the EMR_ADMIN_SECRET environment variable.
+# Required for CLI management operations against a running server.
+# Set it with: export EMR_ADMIN_SECRET=<your-secret>
+"#,
+        bind = default_bind(),
+        batch_window_ms = default_batch_window_ms(),
+        channel_capacity = default_channel_capacity(),
+        max_retries = default_max_retries(),
+        per_attempt_cap_ms = default_per_attempt_cap_ms(),
+        cumulative_cap_ms = default_cumulative_cap_ms(),
+        rolling_window_minutes = default_rolling_window_minutes(),
+        db_path = default_db_path(),
+    )
+}
+
+// ── Load & validate ──────────────────────────────────────────────────────────
+
+/// Known top-level section keys in the config file.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "server",
+    "multiplexer",
+    "retry",
+    "health",
+    "database",
+    "admin",
+];
+
+/// Known keys per section.
+const KNOWN_SERVER_KEYS: &[&str] = &["bind"];
+const KNOWN_MULTIPLEXER_KEYS: &[&str] = &["batch_window_ms", "channel_capacity"];
+const KNOWN_RETRY_KEYS: &[&str] = &["max_retries", "per_attempt_cap_ms", "cumulative_cap_ms"];
+const KNOWN_HEALTH_KEYS: &[&str] = &["rolling_window_minutes"];
+const KNOWN_DATABASE_KEYS: &[&str] = &["path"];
+const KNOWN_ADMIN_KEYS: &[&str] = &[];
+
+/// Collect unknown fields from a TOML table.
+fn collect_unknown_keys(table: &toml::map::Map<String, Value>, known: &[&str], section: &str) -> Vec<String> {
+    table
+        .keys()
+        .filter(|k| !known.contains(&k.as_str()))
+        .map(|k| format!("{}.{}", section, k))
+        .collect()
+}
+
+/// Result of loading a config file, including any warnings.
+pub struct LoadedConfig {
+    pub config: Config,
+    pub warnings: Vec<String>,
+}
+
+/// Load and parse a config file, collecting unknown-field warnings.
+pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigError> {
+    if !path.exists() {
+        return Err(ConfigError::NotFound {
+            path: path.display().to_string(),
+        });
+    }
+
+    let content = std::fs::read_to_string(path)?;
+
+    // Parse as raw TOML Value first to detect unknown fields
+    let raw: Value = content
+        .parse::<Value>()
+        .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+    let mut warnings = Vec::new();
+
+    if let Value::Table(ref top) = raw {
+        // Check top-level unknown sections
+        let unknown_top: Vec<String> = top
+            .keys()
+            .filter(|k| !KNOWN_TOP_LEVEL_KEYS.contains(&k.as_str()))
+            .map(|k| format!("unknown section [{}]", k))
+            .collect();
+        warnings.extend(unknown_top);
+
+        // Check fields within known sections
+        let section_checks: &[(&str, &[&str])] = &[
+            ("server", KNOWN_SERVER_KEYS),
+            ("multiplexer", KNOWN_MULTIPLEXER_KEYS),
+            ("retry", KNOWN_RETRY_KEYS),
+            ("health", KNOWN_HEALTH_KEYS),
+            ("database", KNOWN_DATABASE_KEYS),
+            ("admin", KNOWN_ADMIN_KEYS),
+        ];
+
+        for (section_name, known_keys) in section_checks {
+            if let Some(Value::Table(ref section_table)) = top.get(*section_name) {
+                let unknowns = collect_unknown_keys(section_table, known_keys, section_name);
+                for u in unknowns {
+                    warnings.push(format!("unknown field: {}", u));
+                }
+            }
+        }
+    }
+
+    // Deserialize into typed Config
+    let config: Config = toml::from_str(&content)
+        .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+
+    Ok(LoadedConfig { config, warnings })
+}
+
+/// Validate a loaded config, returning a list of error messages.
+/// Returns Ok(warnings) if valid, Err(ConfigError::ValidationFailed) if invalid.
+pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
+    let mut errors = Vec::new();
+
+    // Validate server.bind is non-empty
+    if config.server.bind.trim().is_empty() {
+        errors.push("server.bind must not be empty".to_string());
+    }
+
+    // Validate server.bind looks like a valid address
+    if !config.server.bind.is_empty() && !config.server.bind.contains(':') {
+        errors.push(format!(
+            "server.bind '{}' must be in the form host:port",
+            config.server.bind
+        ));
+    }
+
+    // Validate multiplexer values
+    if config.multiplexer.batch_window_ms == 0 {
+        errors.push("multiplexer.batch_window_ms must be greater than 0".to_string());
+    }
+    if config.multiplexer.channel_capacity == 0 {
+        errors.push("multiplexer.channel_capacity must be greater than 0".to_string());
+    }
+
+    // Validate retry values
+    if config.retry.per_attempt_cap_ms == 0 {
+        errors.push("retry.per_attempt_cap_ms must be greater than 0".to_string());
+    }
+    if config.retry.cumulative_cap_ms == 0 {
+        errors.push("retry.cumulative_cap_ms must be greater than 0".to_string());
+    }
+    if config.retry.per_attempt_cap_ms > config.retry.cumulative_cap_ms {
+        errors.push(
+            "retry.per_attempt_cap_ms must be <= retry.cumulative_cap_ms".to_string(),
+        );
+    }
+
+    // Validate health values
+    if config.health.rolling_window_minutes == 0 {
+        errors.push("health.rolling_window_minutes must be greater than 0".to_string());
+    }
+
+    // Validate database path is non-empty
+    if config.database.path.trim().is_empty() {
+        errors.push("database.path must not be empty".to_string());
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigError::ValidationFailed {
+            errors: errors.join("\n"),
+        })
+    }
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_temp_toml(content: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().expect("failed to create temp file");
+        f.write_all(content.as_bytes()).expect("failed to write");
+        f
+    }
+
+    // ── Default config template ──────────────────────────────────────────────
+
+    #[test]
+    fn test_default_config_toml_contains_all_sections() {
+        let toml = default_config_toml();
+        assert!(toml.contains("[server]"), "missing [server]");
+        assert!(toml.contains("[multiplexer]"), "missing [multiplexer]");
+        assert!(toml.contains("[retry]"), "missing [retry]");
+        assert!(toml.contains("[health]"), "missing [health]");
+        assert!(toml.contains("[database]"), "missing [database]");
+        assert!(toml.contains("[admin]"), "missing [admin]");
+    }
+
+    #[test]
+    fn test_default_config_toml_has_sensible_defaults() {
+        let toml = default_config_toml();
+        assert!(toml.contains("127.0.0.1:3200"), "bind default wrong");
+        assert!(toml.contains("batch_window_ms = 50"), "batch_window_ms default wrong");
+        assert!(toml.contains("channel_capacity = 1024"), "channel_capacity default wrong");
+        assert!(toml.contains("max_retries = 2"), "max_retries default wrong");
+    }
+
+    #[test]
+    fn test_default_config_toml_is_valid_toml() {
+        let toml_str = default_config_toml();
+        let result: Result<Value, _> = toml_str.parse();
+        assert!(result.is_ok(), "default config is not valid TOML: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_default_config_toml_deserializes_correctly() {
+        let toml_str = default_config_toml();
+        let config: Result<Config, _> = toml::from_str(&toml_str);
+        assert!(config.is_ok(), "default config fails to deserialize: {:?}", config.err());
+        let config = config.unwrap();
+        assert_eq!(config.server.bind, "127.0.0.1:3200");
+        assert_eq!(config.multiplexer.batch_window_ms, 50);
+        assert_eq!(config.multiplexer.channel_capacity, 1024);
+        assert_eq!(config.retry.max_retries, 2);
+        assert_eq!(config.retry.per_attempt_cap_ms, 15000);
+        assert_eq!(config.retry.cumulative_cap_ms, 45000);
+        assert_eq!(config.health.rolling_window_minutes, 60);
+        assert_eq!(config.database.path, "~/.config/emr/emr.db");
+    }
+
+    // ── Config::default() ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_default_values() {
+        let config = Config::default();
+        assert_eq!(config.server.bind, "127.0.0.1:3200");
+        assert_eq!(config.multiplexer.batch_window_ms, 50);
+        assert_eq!(config.multiplexer.channel_capacity, 1024);
+        assert_eq!(config.retry.max_retries, 2);
+        assert_eq!(config.retry.per_attempt_cap_ms, 15000);
+        assert_eq!(config.retry.cumulative_cap_ms, 45000);
+        assert_eq!(config.health.rolling_window_minutes, 60);
+        assert_eq!(config.database.path, "~/.config/emr/emr.db");
+    }
+
+    // ── load_config ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_load_config_not_found() {
+        let result = load_config(Path::new("/nonexistent/path/config.toml"));
+        assert!(matches!(result, Err(ConfigError::NotFound { .. })));
+    }
+
+    #[test]
+    fn test_load_config_valid() {
+        let toml_str = default_config_toml();
+        let f = write_temp_toml(&toml_str);
+        let result = load_config(f.path());
+        assert!(result.is_ok(), "should load valid config: {:?}", result.err());
+        let loaded = result.unwrap();
+        assert_eq!(loaded.config.server.bind, "127.0.0.1:3200");
+        assert!(loaded.warnings.is_empty(), "should have no warnings for default config");
+    }
+
+    #[test]
+    fn test_load_config_invalid_toml() {
+        let f = write_temp_toml("not valid toml ][");
+        let result = load_config(f.path());
+        assert!(matches!(result, Err(ConfigError::ParseError(_))));
+    }
+
+    #[test]
+    fn test_load_config_detects_unknown_section() {
+        let toml_str = format!("{}\n[unknown_section]\nfoo = \"bar\"\n", default_config_toml());
+        let f = write_temp_toml(&toml_str);
+        let result = load_config(f.path());
+        assert!(result.is_ok());
+        let loaded = result.unwrap();
+        assert!(
+            !loaded.warnings.is_empty(),
+            "should warn about unknown section"
+        );
+        let has_unknown_warning = loaded.warnings.iter().any(|w| w.contains("unknown_section"));
+        assert!(has_unknown_warning, "warning should mention 'unknown_section': {:?}", loaded.warnings);
+    }
+
+    #[test]
+    fn test_load_config_detects_unknown_field_in_section() {
+        let content = r#"
+[server]
+bind = "127.0.0.1:3200"
+mystery_field = "oops"
+
+[multiplexer]
+batch_window_ms = 50
+channel_capacity = 1024
+
+[retry]
+max_retries = 2
+per_attempt_cap_ms = 15000
+cumulative_cap_ms = 45000
+
+[health]
+rolling_window_minutes = 60
+
+[database]
+path = "~/.config/emr/emr.db"
+
+[admin]
+"#;
+        let f = write_temp_toml(content);
+        let result = load_config(f.path());
+        // Note: serde with Deserialize ignores unknown fields by default in toml crate
+        // Our manual check catches them
+        assert!(result.is_ok());
+        let loaded = result.unwrap();
+        assert!(
+            !loaded.warnings.is_empty(),
+            "should warn about unknown field 'mystery_field': {:?}",
+            loaded.warnings
+        );
+        let has_field_warning = loaded.warnings.iter().any(|w| w.contains("mystery_field"));
+        assert!(has_field_warning, "warning should mention 'mystery_field': {:?}", loaded.warnings);
+    }
+
+    // ── validate_config ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_config_default_is_valid() {
+        let config = Config::default();
+        assert!(validate_config(&config).is_ok(), "default config should be valid");
+    }
+
+    #[test]
+    fn test_validate_config_empty_bind_fails() {
+        let mut config = Config::default();
+        config.server.bind = String::new();
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bind"), "error should mention 'bind': {}", err);
+    }
+
+    #[test]
+    fn test_validate_config_bind_without_port_fails() {
+        let mut config = Config::default();
+        config.server.bind = "localhost".to_string();
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("bind") || err.contains("host:port"), "error should describe bind issue: {}", err);
+    }
+
+    #[test]
+    fn test_validate_config_zero_batch_window_fails() {
+        let mut config = Config::default();
+        config.multiplexer.batch_window_ms = 0;
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("batch_window_ms"), "error should mention 'batch_window_ms': {}", err);
+    }
+
+    #[test]
+    fn test_validate_config_per_attempt_exceeds_cumulative_fails() {
+        let mut config = Config::default();
+        config.retry.per_attempt_cap_ms = 50000;
+        config.retry.cumulative_cap_ms = 10000;
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("per_attempt_cap_ms") || err.contains("cumulative_cap_ms"),
+            "error should mention cap fields: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_config_empty_db_path_fails() {
+        let mut config = Config::default();
+        config.database.path = "   ".to_string();
+        let result = validate_config(&config);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("path") || err.contains("database"), "error should mention database path: {}", err);
+    }
+
+    // ── ConfigError display ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_error_not_found_message() {
+        let err = ConfigError::NotFound { path: "/foo/bar.toml".to_string() };
+        assert!(err.to_string().contains("/foo/bar.toml"));
+    }
+
+    #[test]
+    fn test_config_error_already_exists_message() {
+        let err = ConfigError::AlreadyExists { path: "/foo/bar.toml".to_string() };
+        assert!(err.to_string().contains("already exists"));
+        assert!(err.to_string().contains("/foo/bar.toml"));
+    }
+
+    #[test]
+    fn test_config_error_validation_failed_message() {
+        let err = ConfigError::ValidationFailed { errors: "server.bind is empty".to_string() };
+        assert!(err.to_string().contains("server.bind is empty"));
+    }
+}
