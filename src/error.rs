@@ -42,6 +42,13 @@ pub enum ProviderError {
 
     #[error("provider error: {0}")]
     Other(String),
+
+    #[error("provider '{provider}' rate-limited (429)")]
+    RateLimited {
+        provider: String,
+        /// Value of the Retry-After header, in seconds (if present).
+        retry_after: Option<f64>,
+    },
 }
 
 /// Errors that can occur when interacting with the database.

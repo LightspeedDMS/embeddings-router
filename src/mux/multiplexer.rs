@@ -9,6 +9,7 @@ use crate::mux::accumulator::BatchAccumulator;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
 use crate::provider::registry::ProviderRegistry;
+use crate::retry::{execute_with_backoff, BackoffConfig};
 
 /// Fallback maximum texts per request used only when the provider cannot be
 /// looked up at accumulation time (indicates a configuration error).
@@ -47,15 +48,21 @@ pub(crate) struct MuxState {
     pub(crate) next_id: usize,
     pub(crate) batch_window: Duration,
     pub(crate) providers: Arc<ProviderRegistry>,
+    pub(crate) retry_config: BackoffConfig,
 }
 
 impl MuxState {
-    pub(crate) fn new(batch_window: Duration, providers: Arc<ProviderRegistry>) -> Self {
+    pub(crate) fn new(
+        batch_window: Duration,
+        providers: Arc<ProviderRegistry>,
+        retry_config: BackoffConfig,
+    ) -> Self {
         Self {
             slots: HashMap::new(),
             next_id: 0,
             batch_window,
             providers,
+            retry_config,
         }
     }
 
@@ -86,9 +93,10 @@ pub async fn run_multiplexer(
     mut rx: mpsc::Receiver<MuxRequest>,
     providers: Arc<ProviderRegistry>,
     batch_window_ms: u64,
+    retry_config: BackoffConfig,
 ) {
     let batch_window = Duration::from_millis(batch_window_ms);
-    let mut state = MuxState::new(batch_window, providers);
+    let mut state = MuxState::new(batch_window, providers, retry_config);
 
     loop {
         match state.earliest_deadline() {
@@ -272,7 +280,12 @@ pub(crate) async fn flush_slot(provider_name: &str, state: &mut MuxState) {
         }
     };
 
-    let result = provider.embed_batch(&texts).await;
+    let result = execute_with_backoff(&state.retry_config, || {
+        let p = provider.clone();
+        let t = texts.clone();
+        async move { p.embed_batch(&t).await }
+    })
+    .await;
 
     let slot = state.slots.get_mut(provider_name).unwrap();
     match result {

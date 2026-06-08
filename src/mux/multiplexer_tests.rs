@@ -3,6 +3,7 @@
 //! These tests exercise all 8 acceptance criteria for Story #7.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,6 +15,7 @@ use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{EmbeddingBatch, EmbeddingProvider};
+use crate::retry::BackoffConfig;
 
 // ── Test providers ─────────────────────────────────────────────────────────────
 
@@ -67,7 +69,63 @@ impl EmbeddingProvider for FailingProvider {
     }
 }
 
+// ── Test providers ─────────────────────────────────────────────────────────────
+
+/// Returns 429 on the first call, then succeeds on subsequent calls.
+struct RateLimitedThenSuccessProvider {
+    name: String,
+    call_count: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl EmbeddingProvider for RateLimitedThenSuccessProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<EmbeddingBatch, ProviderError> {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            Err(ProviderError::RateLimited {
+                provider: self.name.clone(),
+                retry_after: Some(0.001), // tiny value so test stays fast
+            })
+        } else {
+            Ok(EmbeddingBatch {
+                embeddings: texts.iter().map(|_| vec![0.1_f32, 0.2]).collect(),
+                total_tokens: Some(texts.len() as u32),
+            })
+        }
+    }
+    async fn health_probe(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn max_texts_per_request(&self) -> usize {
+        128
+    }
+    fn model(&self) -> &str {
+        "test-model"
+    }
+}
+
 // ── Test helpers ───────────────────────────────────────────────────────────────
+
+/// BackoffConfig with zero retries — keeps existing tests fast and unaffected.
+fn no_retry_config() -> BackoffConfig {
+    BackoffConfig {
+        max_retries: 0,
+        per_attempt_cap: Duration::from_millis(1),
+        cumulative_cap: Duration::from_millis(1),
+    }
+}
+
+/// BackoffConfig that allows 1 retry with minimal sleep, for retry tests.
+fn one_retry_config() -> BackoffConfig {
+    BackoffConfig {
+        max_retries: 1,
+        per_attempt_cap: Duration::from_millis(10),
+        cumulative_cap: Duration::from_millis(100),
+    }
+}
 
 fn build_registry(max_texts: usize) -> Arc<ProviderRegistry> {
     let mut reg = ProviderRegistry::new();
@@ -131,7 +189,7 @@ async fn send_req(
 async fn test_multiplexer_single_caller_gets_result() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
 
     let result = send_req(
         &tx,
@@ -152,7 +210,7 @@ async fn test_multiplexer_single_caller_gets_result() {
 async fn test_multiplexer_demux_correct_slice() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 20));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config()));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -190,7 +248,7 @@ async fn test_multiplexer_capacity_flush() {
     let registry = build_registry(3);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window — only capacity flush should trigger.
-    tokio::spawn(run_multiplexer(rx, registry, 60_000));
+    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config()));
 
     let result = send_req(
         &tx,
@@ -210,7 +268,7 @@ async fn test_multiplexer_graceful_shutdown() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window so only shutdown triggers the flush.
-    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000));
+    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config()));
 
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(MuxRequest {
@@ -269,7 +327,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // 20ms window — well within the test timeout.
-    tokio::spawn(run_multiplexer(rx, registry, 20));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config()));
 
     let handles: Vec<_> = (0..3)
         .map(|i| {
@@ -297,7 +355,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
 async fn test_multiplexer_multi_provider_any() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
 
     let result = send_req(
         &tx,
@@ -320,7 +378,7 @@ async fn test_multiplexer_multi_provider_any() {
 async fn test_multiplexer_multi_provider_all_one_fails() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
 
     let result = send_req(
         &tx,
@@ -356,7 +414,7 @@ async fn test_multiplexer_multi_provider_all_one_fails() {
 async fn test_multiplexer_provider_failure_in_failed_map() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
 
     let result = send_req(
         &tx,
@@ -380,7 +438,7 @@ async fn test_multiplexer_provider_failure_in_failed_map() {
 async fn test_multiplexer_batch_sub_requests_same_mux() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config()));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -409,7 +467,7 @@ async fn test_multiplexer_overflow_splits_correctly() {
     // Max 2 texts; first caller takes 2 → slot full → second goes to new slot.
     let registry = build_registry(2);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config()));
 
     let r1 = send_req(
         &tx,
@@ -429,4 +487,49 @@ async fn test_multiplexer_overflow_splits_correctly() {
 
     assert_eq!(r1.unwrap().results["test-p"].embeddings.len(), 2);
     assert_eq!(r2.unwrap().results["test-p"].embeddings.len(), 1);
+}
+
+/// Story #8 AC: Multiplexer retries transparently on 429 RateLimited.
+/// The provider returns 429 on first call, succeeds on second call.
+/// With max_retries=1, the multiplexer should return a successful response.
+#[tokio::test]
+async fn test_multiplexer_retries_on_rate_limited() {
+    let call_count = Arc::new(AtomicU32::new(0));
+    let provider = RateLimitedThenSuccessProvider {
+        name: "retry-p".to_string(),
+        call_count: call_count.clone(),
+    };
+
+    let mut reg = ProviderRegistry::new();
+    reg.register("retry-p".to_string(), Arc::new(provider));
+    let registry = Arc::new(reg);
+
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config()));
+
+    let result = send_req(
+        &tx,
+        vec!["hello".to_string()],
+        vec!["retry-p".to_string()],
+        RoutingPolicy::Any,
+    )
+    .await;
+
+    let resp = result.expect("retry must eventually succeed");
+    assert!(
+        resp.results.contains_key("retry-p"),
+        "result must be present after retry: {:?}",
+        resp
+    );
+    assert_eq!(
+        resp.results["retry-p"].embeddings.len(),
+        1,
+        "must return 1 embedding after retry"
+    );
+    // Provider was called twice: once failing with 429, once succeeding.
+    assert_eq!(
+        call_count.load(Ordering::SeqCst),
+        2,
+        "provider should be called exactly 2 times (1 initial + 1 retry)"
+    );
 }

@@ -9,6 +9,7 @@
 //! with fake data — no real HTTP calls to external APIs. No mocking.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use emr::{
@@ -16,6 +17,7 @@ use emr::{
     db::{generate_api_key, Database},
     mux::run_multiplexer,
     provider::{registry::ProviderRegistry, EmbeddingBatch, EmbeddingProvider},
+    retry::BackoffConfig,
     server::{create_router, AppState},
 };
 use tokio::sync::Mutex;
@@ -88,7 +90,12 @@ async fn start_embedding_test_server() -> (String, String) {
 
     let providers_arc = Arc::new(registry);
     let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
+    let no_retry = BackoffConfig {
+        max_retries: 0,
+        per_attempt_cap: Duration::from_millis(1),
+        cumulative_cap: Duration::from_millis(1),
+    };
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -415,7 +422,12 @@ async fn start_multi_provider_test_server() -> (String, String) {
 
     let providers_arc = Arc::new(registry);
     let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
+    let no_retry = BackoffConfig {
+        max_retries: 0,
+        per_attempt_cap: Duration::from_millis(1),
+        cumulative_cap: Duration::from_millis(1),
+    };
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -613,6 +625,173 @@ async fn test_single_provider_backward_compat() {
     let body: serde_json::Value = resp.json().await.expect("response is not JSON");
     assert!(body["data"].is_array(), "single-provider response must have data array");
     assert_eq!(body["provider"], "test-voyage");
+}
+
+// ── Story #8: 429 rate-limit propagation ─────────────────────────────────────
+
+/// A provider that always responds with RateLimited (429 exhausted after retries).
+struct RateLimitedProvider {
+    name: String,
+}
+
+#[async_trait]
+impl EmbeddingProvider for RateLimitedProvider {
+    async fn embed_batch(
+        &self,
+        _texts: &[String],
+    ) -> Result<EmbeddingBatch, emr::error::ProviderError> {
+        Err(emr::error::ProviderError::RateLimited {
+            provider: self.name.clone(),
+            retry_after: Some(30.0),
+        })
+    }
+
+    async fn health_probe(&self) -> Result<(), emr::error::ProviderError> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn max_texts_per_request(&self) -> usize {
+        128
+    }
+
+    fn model(&self) -> &str {
+        "rate-limited-model"
+    }
+}
+
+/// Start a test server with a single always-rate-limited provider.
+/// Uses zero retries so the 429 propagates immediately.
+async fn start_rate_limited_test_server() -> (String, String) {
+    let db = Database::open_in_memory().expect("failed to open in-memory db");
+
+    let (raw_key, key_hash, key_prefix) =
+        generate_api_key().expect("key generation failed");
+    db.insert_api_key("test-key-id", "test-caller", &key_hash, &key_prefix)
+        .expect("failed to insert test api key");
+
+    let mut registry = ProviderRegistry::new();
+    registry.register(
+        "rate-limited-provider".to_string(),
+        Arc::new(RateLimitedProvider {
+            name: "rate-limited-provider".to_string(),
+        }),
+    );
+
+    let providers_arc = Arc::new(registry);
+    let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
+    // Zero retries: 429 propagates immediately without retry delay.
+    let no_retry = BackoffConfig {
+        max_retries: 0,
+        per_attempt_cap: Duration::from_millis(1),
+        cumulative_cap: Duration::from_millis(1),
+    };
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
+
+    let state = AppState {
+        db: Arc::new(Mutex::new(db)),
+        config: Arc::new(Config::default()),
+        admin_secret: "test-admin-secret".to_string(),
+        providers: providers_arc,
+        start_time: std::time::Instant::now(),
+        mux_tx,
+    };
+
+    let router = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind");
+    let addr = listener.local_addr().expect("failed to get local addr");
+    let base_url = format!("http://127.0.0.1:{}", addr.port());
+
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("server error");
+    });
+
+    (base_url, raw_key)
+}
+
+/// POST /v1/embeddings to a rate-limited provider → HTTP 429 with retry-after header.
+#[tokio::test]
+async fn test_embed_rate_limited_returns_429() {
+    let (base_url, raw_key) = start_rate_limited_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/embeddings", base_url))
+        .header("Authorization", format!("Bearer {}", raw_key))
+        .json(&serde_json::json!({
+            "input": ["hello world"],
+            "provider": "rate-limited-provider"
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        429,
+        "rate-limited provider → 429. body: {:?}",
+        resp.text().await.unwrap_or_default()
+    );
+}
+
+/// POST /v1/embeddings to a rate-limited provider → response body contains rate_limited error type.
+#[tokio::test]
+async fn test_embed_rate_limited_error_body() {
+    let (base_url, raw_key) = start_rate_limited_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/embeddings", base_url))
+        .header("Authorization", format!("Bearer {}", raw_key))
+        .json(&serde_json::json!({
+            "input": ["hello world"],
+            "provider": "rate-limited-provider"
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 429);
+
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    assert!(body["error"].is_object(), "error field must be present");
+    assert_eq!(
+        body["error"]["type"],
+        "rate_limited",
+        "error type must be rate_limited"
+    );
+}
+
+/// POST /v1/embeddings/batch to a rate-limited provider → HTTP 429.
+#[tokio::test]
+async fn test_embed_batch_rate_limited_returns_429() {
+    let (base_url, raw_key) = start_rate_limited_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/v1/embeddings/batch", base_url))
+        .header("Authorization", format!("Bearer {}", raw_key))
+        .json(&serde_json::json!({
+            "requests": [
+                {"id": "req-1", "input": ["hello world"], "providers": ["rate-limited-provider"]}
+            ]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(
+        resp.status(),
+        429,
+        "batch rate-limited → 429. body: {:?}",
+        resp.text().await.unwrap_or_default()
+    );
 }
 
 /// POST /v1/embeddings with providers: ["test-voyage", "test-cohere"] → both

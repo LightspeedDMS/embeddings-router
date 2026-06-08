@@ -7,6 +7,7 @@ use crate::{
     db::Database,
     error::ConfigError,
     provider::registry::ProviderRegistry,
+    retry::BackoffConfig,
     server::{create_router, AppState},
     mux::run_multiplexer,
 };
@@ -95,10 +96,12 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
 
     let providers_arc = Arc::new(registry);
     let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(config.multiplexer.channel_capacity);
+    let retry_config = BackoffConfig::from_config(&config.retry);
     tokio::spawn(run_multiplexer(
         mux_rx,
         providers_arc.clone(),
         config.multiplexer.batch_window_ms,
+        retry_config,
     ));
 
     let state = AppState {

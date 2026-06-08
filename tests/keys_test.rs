@@ -3,12 +3,14 @@
 //! database. Uses `reqwest` for HTTP calls. No mocking.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use emr::{
     config::Config,
     db::Database,
     mux::run_multiplexer,
     provider::registry::ProviderRegistry,
+    retry::BackoffConfig,
     server::{create_router, AppState},
 };
 use tokio::sync::Mutex;
@@ -20,7 +22,12 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
     let db = Database::open_in_memory().expect("failed to create in-memory database");
     let providers_arc = Arc::new(ProviderRegistry::new());
     let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
+    let no_retry = BackoffConfig {
+        max_retries: 0,
+        per_attempt_cap: Duration::from_millis(1),
+        cumulative_cap: Duration::from_millis(1),
+    };
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),

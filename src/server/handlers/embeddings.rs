@@ -190,6 +190,21 @@ pub async fn embed(
                             .get(&provider_name)
                             .cloned()
                             .unwrap_or_else(|| "provider returned no result".to_string());
+
+                        // Propagate 429 if the provider was rate-limited.
+                        if msg.contains("rate-limited (429)") {
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "type": "rate_limited",
+                                        "message": msg
+                                    }
+                                })),
+                            )
+                                .into_response();
+                        }
+
                         (
                             StatusCode::BAD_GATEWAY,
                             Json(serde_json::json!({
@@ -529,6 +544,21 @@ pub async fn embed_batch(
                         .get(&provider_name)
                         .cloned()
                         .unwrap_or_else(|| "provider returned no result".to_string());
+
+                    // Propagate 429 if the provider was rate-limited.
+                    if msg.contains("rate-limited (429)") {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "type": "rate_limited",
+                                    "message": msg
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+
                     return (
                         StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({

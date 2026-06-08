@@ -73,6 +73,18 @@ impl EmbeddingProvider for CohereProvider {
                 message: e.to_string(),
             })?;
 
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f64>().ok());
+            return Err(ProviderError::RateLimited {
+                provider: self.name.clone(),
+                retry_after,
+            });
+        }
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
@@ -198,5 +210,43 @@ mod tests {
         let json_str = r#"{"embeddings": {"float": []}}"#;
         let resp: CohereResponse = serde_json::from_str(json_str).unwrap();
         assert!(resp.embeddings.float.is_empty());
+    }
+
+    // ── 429 / RateLimited error variant tests ────────────────────────────────
+
+    #[test]
+    fn test_rate_limited_error_with_retry_after() {
+        let err = crate::error::ProviderError::RateLimited {
+            provider: "cohere-prod".to_string(),
+            retry_after: Some(60.0),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cohere-prod"), "error should mention provider name");
+        assert!(msg.contains("rate-limited (429)"), "error should mention rate-limited");
+    }
+
+    #[test]
+    fn test_rate_limited_error_without_retry_after() {
+        let err = crate::error::ProviderError::RateLimited {
+            provider: "cohere-prod".to_string(),
+            retry_after: None,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cohere-prod"), "error should mention provider name");
+        assert!(msg.contains("rate-limited (429)"), "error should mention rate-limited");
+    }
+
+    #[test]
+    fn test_rate_limited_retry_after_parsed_from_header_value() {
+        let header_value = "30";
+        let parsed: Option<f64> = header_value.parse::<f64>().ok();
+        assert_eq!(parsed, Some(30.0), "should parse retry-after header as f64");
+    }
+
+    #[test]
+    fn test_rate_limited_retry_after_invalid_header_yields_none() {
+        let header_value = "Wed, 21 Oct 2025 07:28:00 GMT";
+        let parsed: Option<f64> = header_value.parse::<f64>().ok();
+        assert!(parsed.is_none(), "date-format retry-after should parse as None");
     }
 }
