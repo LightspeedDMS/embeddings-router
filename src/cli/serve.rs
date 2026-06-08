@@ -56,8 +56,10 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         ConfigError::WriteError(format!("failed to open database: {}", e))
     })?;
 
+    let db_arc = Arc::new(Mutex::new(db));
+
     let state = AppState {
-        db: Arc::new(Mutex::new(db)),
+        db: db_arc.clone(),
         config: Arc::new(config.clone()),
         admin_secret,
     };
@@ -72,6 +74,20 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
                 config.server.bind, e
             ))
         })?;
+
+    // Warn if no active caller API keys exist — all /v1/* requests will 401
+    {
+        let db_guard = db_arc.lock().await;
+        match db_guard.get_active_key_hashes() {
+            Ok(hashes) if hashes.is_empty() => {
+                tracing::warn!(
+                    "No active caller API keys — all /v1/* requests will return 401. \
+                     Create a key with: emr keys create --name <name>"
+                );
+            }
+            _ => {}
+        }
+    }
 
     tracing::info!("Server listening on {}", config.server.bind);
     axum::serve(listener, app)

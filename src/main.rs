@@ -60,13 +60,48 @@ enum Commands {
 #[derive(Subcommand)]
 enum KeysCommands {
     /// Create a new API key
-    Create,
+    Create {
+        /// Human-readable name for this key (e.g. "ci-pipeline")
+        #[arg(long)]
+        name: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
     /// List all API keys
-    List,
-    /// Revoke an API key
-    Revoke,
-    /// Rotate an API key
-    Rotate,
+    List {
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
+    /// Revoke an API key by id
+    Revoke {
+        /// Key id to revoke
+        id: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
+    /// Rotate an API key (revoke old, issue new)
+    Rotate {
+        /// Key id to rotate
+        id: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
 }
 
 // ── Providers subcommands ────────────────────────────────────────────────────
@@ -184,12 +219,7 @@ async fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
         }
 
         Commands::Keys { command } => {
-            match command {
-                KeysCommands::Create => println!("keys create: not yet implemented"),
-                KeysCommands::List => println!("keys list: not yet implemented"),
-                KeysCommands::Revoke => println!("keys revoke: not yet implemented"),
-                KeysCommands::Rotate => println!("keys rotate: not yet implemented"),
-            }
+            dispatch_keys(command).await?;
             Ok(())
         }
 
@@ -222,6 +252,25 @@ async fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
         Commands::Down => {
             println!("down: not yet implemented (planned for Story #10)");
             Ok(())
+        }
+    }
+}
+
+async fn dispatch_keys(command: KeysCommands) -> Result<(), error::ConfigError> {
+    use emr::cli::keys::{cmd_keys_create, cmd_keys_list, cmd_keys_revoke, cmd_keys_rotate};
+
+    match command {
+        KeysCommands::Create { name, server, admin_secret } => {
+            cmd_keys_create(&name, &server, &admin_secret).await
+        }
+        KeysCommands::List { server, admin_secret } => {
+            cmd_keys_list(&server, &admin_secret).await
+        }
+        KeysCommands::Revoke { id, server, admin_secret } => {
+            cmd_keys_revoke(&id, &server, &admin_secret).await
+        }
+        KeysCommands::Rotate { id, server, admin_secret } => {
+            cmd_keys_rotate(&id, &server, &admin_secret).await
         }
     }
 }
