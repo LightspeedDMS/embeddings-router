@@ -7,6 +7,7 @@ use std::sync::Arc;
 use emr::{
     config::Config,
     db::Database,
+    provider::registry::ProviderRegistry,
     server::{create_router, AppState},
 };
 use tokio::sync::Mutex;
@@ -20,6 +21,8 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
         admin_secret: "test-secret".to_string(),
+        providers: Arc::new(ProviderRegistry::new()),
+        start_time: std::time::Instant::now(),
     };
     let router = create_router(state);
 

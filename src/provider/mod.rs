@@ -1,4 +1,5 @@
 pub mod cohere;
+pub mod registry;
 pub mod voyage;
 
 use async_trait::async_trait;

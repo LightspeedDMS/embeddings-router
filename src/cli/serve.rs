@@ -6,6 +6,7 @@ use crate::{
     config::{load_config, Config},
     db::Database,
     error::ConfigError,
+    provider::registry::ProviderRegistry,
     server::{create_router, AppState},
 };
 
@@ -13,6 +14,7 @@ use crate::{
 ///
 /// Reads `EMR_ADMIN_SECRET` from the environment (required).
 /// Opens (or creates) the SQLite database at the path configured in `config.toml`.
+/// Loads registered providers from the database and wires them into the registry.
 pub async fn cmd_serve() -> Result<(), ConfigError> {
     // Load config from default path; fall back to defaults if not found.
     let config = match load_config(std::path::Path::new("config.toml")) {
@@ -56,26 +58,27 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         ConfigError::WriteError(format!("failed to open database: {}", e))
     })?;
 
+    // Build provider registry from database records
+    let provider_records = db.list_providers().map_err(|e| {
+        ConfigError::WriteError(format!("failed to list providers: {}", e))
+    })?;
+
+    let registry = ProviderRegistry::from_db_providers(&provider_records).map_err(|e| {
+        ConfigError::WriteError(format!("failed to build provider registry: {}", e))
+    })?;
+
+    let provider_count = registry.len();
+    tracing::info!("Loaded {} provider(s) from database", provider_count);
+    if provider_count == 0 {
+        tracing::warn!(
+            "No providers registered — all /v1/embeddings requests will fail. \
+             Add a provider with: emr providers add --name <name> ..."
+        );
+    }
+
     let db_arc = Arc::new(Mutex::new(db));
 
-    let state = AppState {
-        db: db_arc.clone(),
-        config: Arc::new(config.clone()),
-        admin_secret,
-    };
-
-    let app = create_router(state);
-
-    let listener = tokio::net::TcpListener::bind(&config.server.bind)
-        .await
-        .map_err(|e| {
-            ConfigError::WriteError(format!(
-                "failed to bind to {}: {}",
-                config.server.bind, e
-            ))
-        })?;
-
-    // Warn if no active caller API keys exist — all /v1/* requests will 401
+    // Warn if no active caller API keys exist
     {
         let db_guard = db_arc.lock().await;
         match db_guard.get_active_key_hashes() {
@@ -89,12 +92,61 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         }
     }
 
+    let state = AppState {
+        db: db_arc,
+        config: Arc::new(config.clone()),
+        admin_secret,
+        providers: Arc::new(registry),
+        start_time: std::time::Instant::now(),
+    };
+
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind(&config.server.bind)
+        .await
+        .map_err(|e| {
+            ConfigError::WriteError(format!(
+                "failed to bind to {}: {}",
+                config.server.bind, e
+            ))
+        })?;
+
     tracing::info!("Server listening on {}", config.server.bind);
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| ConfigError::WriteError(format!("server error: {}", e)))?;
 
     Ok(())
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM, then return so the server can shut down.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {
+            tracing::info!("Received SIGINT, shutting down gracefully");
+        }
+        () = sigterm => {
+            tracing::info!("Received SIGTERM, shutting down gracefully");
+        }
+    }
 }
 
 fn expand_tilde(path: &str) -> String {

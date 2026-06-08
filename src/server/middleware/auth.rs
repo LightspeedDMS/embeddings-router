@@ -156,7 +156,7 @@ mod tests {
     use tokio::sync::Mutex;
     use tower::ServiceExt; // for `oneshot`
 
-    use crate::{config::Config, db::Database, server::AppState};
+    use crate::{config::Config, db::Database, provider::registry::ProviderRegistry, server::AppState};
 
     async fn protected_handler(_auth: super::AdminAuth) -> &'static str {
         "ok"
@@ -168,6 +168,8 @@ mod tests {
             db: Arc::new(Mutex::new(db)),
             config: Arc::new(Config::default()),
             admin_secret: secret.to_string(),
+            providers: Arc::new(ProviderRegistry::new()),
+            start_time: std::time::Instant::now(),
         };
         Router::new()
             .route("/admin/test", get(protected_handler))
