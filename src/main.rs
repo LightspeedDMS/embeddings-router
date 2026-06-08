@@ -1,13 +1,10 @@
-mod cli;
-mod config;
-mod error;
-
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use cli::config_cmd::{cmd_config_init, cmd_config_show, cmd_config_validate};
-use cli::serve::cmd_serve;
+use emr::cli::config_cmd::{cmd_config_init, cmd_config_show, cmd_config_validate};
+use emr::cli::serve::cmd_serve;
+use emr::error;
 
 /// Embeddings Router — a unified routing and multiplexing layer for embedding providers.
 #[derive(Parser)]
@@ -77,13 +74,60 @@ enum KeysCommands {
 #[derive(Subcommand)]
 enum ProvidersCommands {
     /// Add an embedding provider
-    Add,
+    Add {
+        /// Provider name (e.g. "voyage-prod")
+        #[arg(long)]
+        name: String,
+        /// Provider type: voyage or cohere
+        #[arg(long = "type")]
+        provider_type: String,
+        /// Environment variable that holds the API key
+        #[arg(long)]
+        api_key_env: String,
+        /// Provider endpoint URL
+        #[arg(long)]
+        endpoint: String,
+        /// Model identifier
+        #[arg(long)]
+        model: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
     /// List configured providers
-    List,
+    List {
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
     /// Remove a provider
-    Remove,
+    Remove {
+        /// Provider name to remove
+        name: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
     /// Test provider connectivity
-    Test,
+    Test {
+        /// Provider name to test
+        name: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET)
+        #[arg(long, env = "EMR_ADMIN_SECRET")]
+        admin_secret: String,
+    },
 }
 
 // ── Config subcommands ───────────────────────────────────────────────────────
@@ -114,7 +158,8 @@ enum ConfigCommands {
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
-fn main() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -124,17 +169,17 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let result = dispatch(cli.command);
+    let result = dispatch(cli.command).await;
     if let Err(e) = result {
         eprintln!("error: {}", e);
         std::process::exit(1);
     }
 }
 
-fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
+async fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
     match command {
         Commands::Serve => {
-            cmd_serve();
+            cmd_serve().await?;
             Ok(())
         }
 
@@ -149,12 +194,7 @@ fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
         }
 
         Commands::Providers { command } => {
-            match command {
-                ProvidersCommands::Add => println!("providers add: not yet implemented"),
-                ProvidersCommands::List => println!("providers list: not yet implemented"),
-                ProvidersCommands::Remove => println!("providers remove: not yet implemented"),
-                ProvidersCommands::Test => println!("providers test: not yet implemented"),
-            }
+            dispatch_providers(command).await?;
             Ok(())
         }
 
@@ -182,6 +222,35 @@ fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
         Commands::Down => {
             println!("down: not yet implemented (planned for Story #10)");
             Ok(())
+        }
+    }
+}
+
+async fn dispatch_providers(command: ProvidersCommands) -> Result<(), error::ConfigError> {
+    use emr::cli::providers::{
+        cmd_providers_add, cmd_providers_list, cmd_providers_remove, cmd_providers_test,
+    };
+
+    match command {
+        ProvidersCommands::Add {
+            name,
+            provider_type,
+            api_key_env,
+            endpoint,
+            model,
+            server,
+            admin_secret,
+        } => {
+            cmd_providers_add(&server, &admin_secret, &name, &provider_type, &api_key_env, &endpoint, &model).await
+        }
+        ProvidersCommands::List { server, admin_secret } => {
+            cmd_providers_list(&server, &admin_secret).await
+        }
+        ProvidersCommands::Remove { name, server, admin_secret } => {
+            cmd_providers_remove(&server, &admin_secret, &name).await
+        }
+        ProvidersCommands::Test { name, server, admin_secret } => {
+            cmd_providers_test(&server, &admin_secret, &name).await
         }
     }
 }
