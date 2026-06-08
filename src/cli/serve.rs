@@ -8,6 +8,7 @@ use crate::{
     error::ConfigError,
     provider::registry::ProviderRegistry,
     server::{create_router, AppState},
+    mux::run_multiplexer,
 };
 
 /// Execute `emr serve` — start the HTTP server.
@@ -92,12 +93,21 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         }
     }
 
+    let providers_arc = Arc::new(registry);
+    let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(config.multiplexer.channel_capacity);
+    tokio::spawn(run_multiplexer(
+        mux_rx,
+        providers_arc.clone(),
+        config.multiplexer.batch_window_ms,
+    ));
+
     let state = AppState {
         db: db_arc,
         config: Arc::new(config.clone()),
         admin_secret,
-        providers: Arc::new(registry),
+        providers: providers_arc,
         start_time: std::time::Instant::now(),
+        mux_tx,
     };
 
     let app = create_router(state);

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use emr::{
     config::Config,
     db::Database,
+    mux::run_multiplexer,
     provider::registry::ProviderRegistry,
     server::{create_router, AppState},
 };
@@ -17,12 +18,16 @@ use tokio::sync::Mutex;
 /// Start a real axum server on a random port. Returns (base_url, join_handle).
 async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
     let db = Database::open_in_memory().expect("failed to create in-memory database");
+    let providers_arc = Arc::new(ProviderRegistry::new());
+    let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
         admin_secret: "test-secret".to_string(),
-        providers: Arc::new(ProviderRegistry::new()),
+        providers: providers_arc,
         start_time: std::time::Instant::now(),
+        mux_tx,
     };
     let router = create_router(state);
 

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use emr::{
     config::Config,
     db::{generate_api_key, Database},
+    mux::run_multiplexer,
     provider::{registry::ProviderRegistry, EmbeddingBatch, EmbeddingProvider},
     server::{create_router, AppState},
 };
@@ -85,12 +86,17 @@ async fn start_embedding_test_server() -> (String, String) {
         }),
     );
 
+    let providers_arc = Arc::new(registry);
+    let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
+
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
         admin_secret: "test-admin-secret".to_string(),
-        providers: Arc::new(registry),
+        providers: providers_arc,
         start_time: std::time::Instant::now(),
+        mux_tx,
     };
 
     let router = create_router(state);
@@ -407,12 +413,17 @@ async fn start_multi_provider_test_server() -> (String, String) {
         }),
     );
 
+    let providers_arc = Arc::new(registry);
+    let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10));
+
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
         admin_secret: "test-admin-secret".to_string(),
-        providers: Arc::new(registry),
+        providers: providers_arc,
         start_time: std::time::Instant::now(),
+        mux_tx,
     };
 
     let router = create_router(state);

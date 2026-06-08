@@ -27,6 +27,8 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     /// Server startup time — used for uptime reporting.
     pub start_time: std::time::Instant,
+    /// Sender half of the multiplexer channel — handlers submit MuxRequests here.
+    pub mux_tx: tokio::sync::mpsc::Sender<crate::mux::MuxRequest>,
 }
 
 // ── Router factory ───────────────────────────────────────────────────────────

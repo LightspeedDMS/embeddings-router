@@ -5,8 +5,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
+use tokio::sync::oneshot;
 
+use crate::mux::{MuxError, MuxRequest};
 use crate::mux::policy::RoutingPolicy;
 use crate::server::{middleware::auth::CallerAuth, AppState};
 
@@ -98,46 +99,119 @@ pub async fn embed(
     match (body.provider, body.providers) {
         // ── Single-provider mode (backward-compatible) ───────────────────────
         (Some(provider_name), _) => {
-            let provider = match state.providers.get(&provider_name) {
-                Some(p) => p,
-                None => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": {
-                                "type": "unknown_provider",
-                                "message": format!("provider '{}' not found", provider_name)
-                            }
-                        })),
-                    )
-                        .into_response();
-                }
+            // Validate provider exists before submitting to mux
+            if state.providers.get(&provider_name).is_none() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "unknown_provider",
+                            "message": format!("provider '{}' not found", provider_name)
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let mux_req = MuxRequest {
+                texts: body.input,
+                providers: vec![provider_name.clone()],
+                policy: RoutingPolicy::Any,
+                response_tx: resp_tx,
             };
 
-            match provider.embed_batch(&body.input).await {
-                Ok(batch) => {
-                    let data: Vec<EmbedDataItem> = batch
-                        .embeddings
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, embedding)| EmbedDataItem { embedding, index })
-                        .collect();
+            if state.mux_tx.try_send(mux_req).is_err() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "overloaded",
+                            "message": "server overloaded — try again later"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
 
-                    let usage = UsageInfo {
-                        total_tokens: batch.total_tokens.unwrap_or(0),
-                    };
-
-                    (
-                        StatusCode::OK,
-                        Json(serde_json::json!(EmbedResponse {
-                            data,
-                            model: provider.model().to_string(),
-                            provider: provider_name,
-                            usage,
+            let mux_result = match resp_rx.await {
+                Ok(r) => r,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "internal_error",
+                                "message": "multiplexer dropped response"
+                            }
                         })),
                     )
                         .into_response()
                 }
+            };
+
+            match mux_result {
+                Ok(resp) => {
+                    if let Some(batch) = resp.results.get(&provider_name) {
+                        let data: Vec<EmbedDataItem> = batch
+                            .embeddings
+                            .iter()
+                            .enumerate()
+                            .map(|(index, embedding)| EmbedDataItem {
+                                embedding: embedding.clone(),
+                                index,
+                            })
+                            .collect();
+
+                        let usage = UsageInfo {
+                            total_tokens: batch.total_tokens.unwrap_or(0),
+                        };
+
+                        let model = state
+                            .providers
+                            .get(&provider_name)
+                            .map(|p| p.model().to_string())
+                            .unwrap_or_default();
+
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!(EmbedResponse {
+                                data,
+                                model,
+                                provider: provider_name,
+                                usage,
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        // Provider ended up in the failed map
+                        let msg = resp
+                            .failed
+                            .get(&provider_name)
+                            .cloned()
+                            .unwrap_or_else(|| "provider returned no result".to_string());
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "type": "provider_error",
+                                    "message": msg
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+                Err(MuxError::Internal(msg)) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "provider_error",
+                            "message": msg
+                        }
+                    })),
+                )
+                    .into_response(),
                 Err(e) => (
                     StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
@@ -166,7 +240,7 @@ pub async fn embed(
                     .into_response();
             }
 
-            // Validate all provider names upfront before spawning tasks
+            // Validate all provider names upfront before submitting to mux
             for name in &provider_names {
                 if state.providers.get(name).is_none() {
                     return (
@@ -182,55 +256,95 @@ pub async fn embed(
                 }
             }
 
-            // Dispatch all providers concurrently
-            let mut join_set: JoinSet<(String, Result<_, _>)> = JoinSet::new();
-            for name in &provider_names {
-                let provider = state.providers.get(name).unwrap().clone();
-                let texts = body.input.clone();
-                let provider_name = name.clone();
-                join_set.spawn(async move {
-                    let result = provider.embed_batch(&texts).await;
-                    (provider_name, result)
-                });
+            let policy = body.policy.unwrap_or_default();
+
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let mux_req = MuxRequest {
+                texts: body.input,
+                providers: provider_names.clone(),
+                policy: policy.clone(),
+                response_tx: resp_tx,
+            };
+
+            if state.mux_tx.try_send(mux_req).is_err() {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "type": "overloaded",
+                            "message": "server overloaded — try again later"
+                        }
+                    })),
+                )
+                    .into_response();
             }
 
+            let mux_result = match resp_rx.await {
+                Ok(r) => r,
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "internal_error",
+                                "message": "multiplexer dropped response"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            };
+
+            let mux_resp = match mux_result {
+                Ok(r) => r,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "internal_error",
+                                "message": e.to_string()
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            };
+
+            // Build results and failed maps in the existing JSON format
             let mut results = serde_json::Map::new();
             let mut failed = serde_json::Map::new();
 
-            while let Some(join_result) = join_set.join_next().await {
-                match join_result.expect("task panicked") {
-                    (name, Ok(batch)) => {
-                        let data: Vec<serde_json::Value> = batch
-                            .embeddings
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, embedding)| {
-                                serde_json::json!({"embedding": embedding, "index": index})
-                            })
-                            .collect();
-                        results.insert(
-                            name.clone(),
-                            serde_json::json!({
-                                "data": data,
-                                "model": state.providers.get(&name).map(|p| p.model().to_string()).unwrap_or_default(),
-                                "usage": {"total_tokens": batch.total_tokens.unwrap_or(0)}
-                            }),
-                        );
-                    }
-                    (name, Err(e)) => {
-                        failed.insert(
-                            name,
-                            serde_json::json!({
-                                "type": "provider_error",
-                                "message": e.to_string()
-                            }),
-                        );
-                    }
-                }
+            for (name, batch) in &mux_resp.results {
+                let data: Vec<serde_json::Value> = batch
+                    .embeddings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, embedding)| {
+                        serde_json::json!({"embedding": embedding, "index": index})
+                    })
+                    .collect();
+                results.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "data": data,
+                        "model": state.providers.get(name).map(|p| p.model().to_string()).unwrap_or_default(),
+                        "usage": {"total_tokens": batch.total_tokens.unwrap_or(0)}
+                    }),
+                );
+            }
+
+            for (name, msg) in &mux_resp.failed {
+                failed.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "type": "provider_error",
+                        "message": msg
+                    }),
+                );
             }
 
             // Apply routing policy
-            let policy = body.policy.unwrap_or_default();
             match policy {
                 RoutingPolicy::All => {
                     if !failed.is_empty() {
@@ -292,13 +406,16 @@ pub async fn embed(
 /// `POST /v1/embeddings/batch` — Embed multiple sub-requests in one call.
 ///
 /// Each sub-request specifies its own provider list; the first provider in
-/// that list is used for the actual embed call.
+/// that list is used for the actual embed call via the multiplexer.
 pub async fn embed_batch(
     State(state): State<AppState>,
     _auth: CallerAuth,
     Json(body): Json<BatchEmbedRequest>,
 ) -> impl IntoResponse {
-    let mut results = Vec::with_capacity(body.requests.len());
+    // Phase 1: validate all sub-requests and submit them all to the mux before
+    // awaiting any response, so they can be batched together.
+    type Pending = (String, String, oneshot::Receiver<Result<crate::mux::MuxResponse, MuxError>>);
+    let mut pending: Vec<Pending> = Vec::with_capacity(body.requests.len());
 
     for sub_req in body.requests {
         // Use first provider in the list
@@ -318,42 +435,111 @@ pub async fn embed_batch(
             }
         };
 
-        let provider = match state.providers.get(&provider_name) {
-            Some(p) => p,
-            None => {
+        // Validate provider exists
+        if state.providers.get(&provider_name).is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "unknown_provider",
+                        "message": format!("provider '{}' not found", provider_name)
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let mux_req = MuxRequest {
+            texts: sub_req.input,
+            providers: vec![provider_name.clone()],
+            policy: RoutingPolicy::Any,
+            response_tx: resp_tx,
+        };
+
+        if state.mux_tx.try_send(mux_req).is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": {
+                        "type": "overloaded",
+                        "message": "server overloaded — try again later"
+                    }
+                })),
+            )
+                .into_response();
+        }
+
+        pending.push((sub_req.id, provider_name, resp_rx));
+    }
+
+    // Phase 2: collect responses in submission order.
+    let mut results = Vec::with_capacity(pending.len());
+
+    for (id, provider_name, resp_rx) in pending {
+        let mux_result = match resp_rx.await {
+            Ok(r) => r,
+            Err(_) => {
                 return (
-                    StatusCode::BAD_REQUEST,
+                    StatusCode::BAD_GATEWAY,
                     Json(serde_json::json!({
                         "error": {
-                            "type": "unknown_provider",
-                            "message": format!("provider '{}' not found", provider_name)
+                            "type": "internal_error",
+                            "message": "multiplexer dropped response"
                         }
                     })),
                 )
-                    .into_response();
+                    .into_response()
             }
         };
 
-        match provider.embed_batch(&sub_req.input).await {
-            Ok(batch) => {
-                let data: Vec<EmbedDataItem> = batch
-                    .embeddings
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, embedding)| EmbedDataItem { embedding, index })
-                    .collect();
+        match mux_result {
+            Ok(resp) => {
+                if let Some(batch) = resp.results.get(&provider_name) {
+                    let data: Vec<EmbedDataItem> = batch
+                        .embeddings
+                        .iter()
+                        .enumerate()
+                        .map(|(index, embedding)| EmbedDataItem {
+                            embedding: embedding.clone(),
+                            index,
+                        })
+                        .collect();
 
-                let usage = UsageInfo {
-                    total_tokens: batch.total_tokens.unwrap_or(0),
-                };
+                    let usage = UsageInfo {
+                        total_tokens: batch.total_tokens.unwrap_or(0),
+                    };
 
-                results.push(BatchResultItem {
-                    id: sub_req.id,
-                    data,
-                    model: provider.model().to_string(),
-                    provider: provider_name,
-                    usage,
-                });
+                    let model = state
+                        .providers
+                        .get(&provider_name)
+                        .map(|p| p.model().to_string())
+                        .unwrap_or_default();
+
+                    results.push(BatchResultItem {
+                        id,
+                        data,
+                        model,
+                        provider: provider_name,
+                        usage,
+                    });
+                } else {
+                    let msg = resp
+                        .failed
+                        .get(&provider_name)
+                        .cloned()
+                        .unwrap_or_else(|| "provider returned no result".to_string());
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "error": {
+                                "type": "provider_error",
+                                "message": msg
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
             }
             Err(e) => {
                 return (

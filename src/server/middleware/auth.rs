@@ -164,12 +164,14 @@ mod tests {
 
     fn make_app(secret: &str) -> Router {
         let db = Database::open_in_memory().unwrap();
+        let (mux_tx, _mux_rx) = tokio::sync::mpsc::channel(1);
         let state = AppState {
             db: Arc::new(Mutex::new(db)),
             config: Arc::new(Config::default()),
             admin_secret: secret.to_string(),
             providers: Arc::new(ProviderRegistry::new()),
             start_time: std::time::Instant::now(),
+            mux_tx,
         };
         Router::new()
             .route("/admin/test", get(protected_handler))
