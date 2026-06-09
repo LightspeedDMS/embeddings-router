@@ -162,4 +162,4 @@ Three-tier model:
 | Caller | `Bearer emr_xxxx...` | `/v1/embeddings`, `/v1/embeddings/batch` | Argon2 hashes in SQLite |
 | Admin | `Bearer <admin-secret>` | `/admin/*` | `EMR_ADMIN_SECRET` env var |
 
-The server distinguishes admin from caller by constant-time comparison against the admin secret before falling back to argon2 key lookup. Caller keys are prefixed with `emr_`, generated via `emr keys create`, and shown exactly once.
+Admin and caller routes use independent extractors (`AdminAuth` and `CallerAuth`). Admin routes validate the Bearer token against `EMR_ADMIN_SECRET` via constant-time comparison. Caller routes validate against argon2 hashes in SQLite. There is no shared middleware or fallback chain — each route type has its own auth path. Caller keys are prefixed with `emr_`, generated via `emr keys create`, and shown exactly once.

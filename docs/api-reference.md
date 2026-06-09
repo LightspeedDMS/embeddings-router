@@ -27,12 +27,14 @@ All errors return JSON with a consistent structure:
 
 | Status | Type | Condition |
 |--------|------|-----------|
-| 400 | `validation_error` | Empty input, missing provider, unknown provider name |
+| 400 | `validation_error` | Empty input, missing provider/providers field |
+| 400 | `unknown_provider` | Provider name not found in registry |
 | 401 | `unauthorized` | Missing or invalid Bearer token |
 | 429 | `rate_limited` | Provider rate-limited after retry exhaustion (includes `Retry-After` header) |
 | 502 | `provider_error` | Provider error (single-provider) |
 | 502 | `policy_failure` | Provider failed under `policy=all` (non-rate-limit) |
 | 502 | `all_providers_failed` | All providers failed under `policy=any` (non-rate-limit) |
+| 502 | `internal_error` | Multiplexer dropped response channel unexpectedly |
 | 503 | `overloaded` | Multiplexer channel full — server at capacity |
 
 ---
@@ -87,7 +89,7 @@ Generate embeddings for a list of texts. Supports single-provider and multi-prov
     "cohere": {
       "data": [{"embedding": [...], "index": 0}],
       "model": "embed-english-v3.0",
-      "usage": {"total_tokens": 4}
+      "usage": {"total_tokens": 0}
     }
   },
   "failed": {}
@@ -159,7 +161,6 @@ Each sub-request uses the first entry in its `providers` array. Results are retu
 | `id` | `string` | Yes | Caller-assigned identifier (returned in response) |
 | `input` | `string[]` | Yes | Texts to embed |
 | `providers` | `string[]` | Yes | Provider names (first is used) |
-| `policy` | `string` | No | Routing policy (default `"any"`) |
 
 ---
 
@@ -169,7 +170,7 @@ All public — no authentication required.
 
 ### GET /health
 
-Load-balancer probe. Returns 200 when the server is operational.
+Load-balancer probe. Returns 200 when all providers are healthy or degraded. Returns 503 when any provider is down.
 
 ```json
 {"status": "ok", "providers": ["voyage", "cohere"]}
@@ -202,7 +203,7 @@ Per-provider health metrics including latency percentiles, error rates, and adap
 
 | Field | Description |
 |-------|-------------|
-| `status` | `healthy`, `degraded`, or `sinbinned` |
+| `status` | `healthy`, `degraded`, `down`, or `sinbinned` |
 | `p50_ms`, `p95_ms`, `p99_ms` | Latency percentiles over rolling window |
 | `error_rate` | Fraction of failed requests (0.0–1.0) |
 | `availability` | Fraction of successful requests (0.0–1.0) |

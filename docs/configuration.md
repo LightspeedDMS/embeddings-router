@@ -11,6 +11,8 @@ bind = "127.0.0.1:3200"       # Listen address
 [multiplexer]
 batch_window_ms = 50           # Max time to accumulate requests before flushing
 channel_capacity = 1024        # Bounded mpsc channel depth (503 when full)
+initial_batch_size = 32        # Starting AIMD flush threshold K per provider
+success_streak_threshold = 10  # Consecutive successes before K decreases by 1
 
 [retry]
 max_retries = 2                # Retry count on 429 (total attempts = max_retries + 1)
@@ -77,7 +79,7 @@ All key commands accept `--server <url>` and `--admin-secret <secret>` (or reads
 | `emr providers list` | List all registered providers |
 | `emr providers remove <name>` | Remove a provider |
 | `emr providers test <name>` | Health-probe a provider (real API call) |
-| `emr providers probe <name>` | Batch size calibration — sends requests at geometric sizes (1,2,4,...,256), reports latency per batch size |
+| `emr providers probe <name>` | Batch size calibration — sends requests at candidate sizes (1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 256), reports latency per batch size |
 
 ### Configuration
 
