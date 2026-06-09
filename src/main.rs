@@ -3,9 +3,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use emr::cli::config_cmd::{cmd_config_init, cmd_config_show, cmd_config_validate};
+use emr::cli::down::cmd_down;
+use emr::cli::env::{default_env_path, resolve_admin_secret};
 use emr::cli::health_cmd::cmd_health;
 use emr::cli::serve::cmd_serve;
 use emr::cli::status::cmd_status;
+use emr::cli::up::cmd_up;
 use emr::error;
 
 /// Embeddings Router — a unified routing and multiplexing layer for embedding providers.
@@ -58,11 +61,28 @@ enum Commands {
         server: String,
     },
 
-    /// Start the router (alias for serve with daemon mode)
-    Up,
+    /// Start the emr Docker container
+    Up {
+        /// Host port to bind
+        #[arg(long, default_value = "3200")]
+        port: u16,
+        /// Path to .env file
+        #[arg(long)]
+        env_file: Option<std::path::PathBuf>,
+        /// Path to config.toml to mount into container
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+    },
 
-    /// Stop the router
-    Down,
+    /// Stop the emr Docker container
+    Down {
+        /// Kill immediately instead of graceful stop
+        #[arg(long)]
+        force: bool,
+        /// Graceful stop timeout in seconds
+        #[arg(long, default_value = "30")]
+        timeout: u64,
+    },
 }
 
 // ── Keys subcommands ─────────────────────────────────────────────────────────
@@ -77,18 +97,18 @@ enum KeysCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// List all API keys
     List {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// Revoke an API key by id
     Revoke {
@@ -97,9 +117,9 @@ enum KeysCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// Rotate an API key (revoke old, issue new)
     Rotate {
@@ -108,9 +128,9 @@ enum KeysCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
 }
 
@@ -138,18 +158,18 @@ enum ProvidersCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// List configured providers
     List {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// Remove a provider
     Remove {
@@ -158,9 +178,9 @@ enum ProvidersCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
     /// Test provider connectivity
     Test {
@@ -169,9 +189,9 @@ enum ProvidersCommands {
         /// Server base URL
         #[arg(long, default_value = "http://localhost:3200")]
         server: String,
-        /// Admin secret (or set EMR_ADMIN_SECRET)
-        #[arg(long, env = "EMR_ADMIN_SECRET")]
-        admin_secret: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
     },
 }
 
@@ -254,13 +274,13 @@ async fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
             Ok(())
         }
 
-        Commands::Up => {
-            println!("up: not yet implemented (planned for Story #10)");
+        Commands::Up { port, env_file, config } => {
+            cmd_up(port, env_file, config).await?;
             Ok(())
         }
 
-        Commands::Down => {
-            println!("down: not yet implemented (planned for Story #10)");
+        Commands::Down { force, timeout } => {
+            cmd_down(force, timeout).await?;
             Ok(())
         }
     }
@@ -271,16 +291,20 @@ async fn dispatch_keys(command: KeysCommands) -> Result<(), error::ConfigError> 
 
     match command {
         KeysCommands::Create { name, server, admin_secret } => {
-            cmd_keys_create(&name, &server, &admin_secret).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_keys_create(&name, &server, &secret).await
         }
         KeysCommands::List { server, admin_secret } => {
-            cmd_keys_list(&server, &admin_secret).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_keys_list(&server, &secret).await
         }
         KeysCommands::Revoke { id, server, admin_secret } => {
-            cmd_keys_revoke(&id, &server, &admin_secret).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_keys_revoke(&id, &server, &secret).await
         }
         KeysCommands::Rotate { id, server, admin_secret } => {
-            cmd_keys_rotate(&id, &server, &admin_secret).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_keys_rotate(&id, &server, &secret).await
         }
     }
 }
@@ -300,16 +324,20 @@ async fn dispatch_providers(command: ProvidersCommands) -> Result<(), error::Con
             server,
             admin_secret,
         } => {
-            cmd_providers_add(&server, &admin_secret, &name, &provider_type, &api_key_env, &endpoint, &model).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_providers_add(&server, &secret, &name, &provider_type, &api_key_env, &endpoint, &model).await
         }
         ProvidersCommands::List { server, admin_secret } => {
-            cmd_providers_list(&server, &admin_secret).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_providers_list(&server, &secret).await
         }
         ProvidersCommands::Remove { name, server, admin_secret } => {
-            cmd_providers_remove(&server, &admin_secret, &name).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_providers_remove(&server, &secret, &name).await
         }
         ProvidersCommands::Test { name, server, admin_secret } => {
-            cmd_providers_test(&server, &admin_secret, &name).await
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_providers_test(&server, &secret, &name).await
         }
     }
 }
