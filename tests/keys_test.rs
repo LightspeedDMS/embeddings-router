@@ -29,7 +29,7 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),

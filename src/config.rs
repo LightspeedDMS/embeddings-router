@@ -18,6 +18,14 @@ fn default_channel_capacity() -> usize {
     1024
 }
 
+fn default_initial_batch_size() -> usize {
+    32
+}
+
+fn default_success_streak_threshold() -> u32 {
+    10
+}
+
 fn default_max_retries() -> u32 {
     2
 }
@@ -80,6 +88,14 @@ pub struct MultiplexerConfig {
     pub batch_window_ms: u64,
     #[serde(default = "default_channel_capacity")]
     pub channel_capacity: usize,
+    /// Soft flush trigger: when accumulated texts reach this count, flush immediately.
+    /// Must be >= 1. Defaults to 32.
+    #[serde(default = "default_initial_batch_size")]
+    pub initial_batch_size: usize,
+    /// Number of consecutive successful flushes before considering batch size increase.
+    /// Defaults to 10.
+    #[serde(default = "default_success_streak_threshold")]
+    pub success_streak_threshold: u32,
 }
 
 impl Default for MultiplexerConfig {
@@ -87,6 +103,8 @@ impl Default for MultiplexerConfig {
         Self {
             batch_window_ms: default_batch_window_ms(),
             channel_capacity: default_channel_capacity(),
+            initial_batch_size: default_initial_batch_size(),
+            success_streak_threshold: default_success_streak_threshold(),
         }
     }
 }
@@ -198,6 +216,10 @@ bind = "{bind}"
 [multiplexer]
 batch_window_ms = {batch_window_ms}
 channel_capacity = {channel_capacity}
+# Soft flush threshold: flush immediately when accumulated texts reach this count.
+initial_batch_size = {initial_batch_size}
+# Consecutive successes before considering batch size adaptation.
+success_streak_threshold = {success_streak_threshold}
 
 [retry]
 max_retries = {max_retries}
@@ -223,6 +245,8 @@ path = "{db_path}"
         bind = default_bind(),
         batch_window_ms = default_batch_window_ms(),
         channel_capacity = default_channel_capacity(),
+        initial_batch_size = default_initial_batch_size(),
+        success_streak_threshold = default_success_streak_threshold(),
         max_retries = default_max_retries(),
         per_attempt_cap_ms = default_per_attempt_cap_ms(),
         cumulative_cap_ms = default_cumulative_cap_ms(),
@@ -250,7 +274,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 
 /// Known keys per section.
 const KNOWN_SERVER_KEYS: &[&str] = &["bind"];
-const KNOWN_MULTIPLEXER_KEYS: &[&str] = &["batch_window_ms", "channel_capacity"];
+const KNOWN_MULTIPLEXER_KEYS: &[&str] = &["batch_window_ms", "channel_capacity", "initial_batch_size", "success_streak_threshold"];
 const KNOWN_RETRY_KEYS: &[&str] = &["max_retries", "per_attempt_cap_ms", "cumulative_cap_ms"];
 const KNOWN_HEALTH_KEYS: &[&str] = &[
     "rolling_window_minutes",
@@ -356,6 +380,9 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
     if config.multiplexer.channel_capacity == 0 {
         errors.push("multiplexer.channel_capacity must be greater than 0".to_string());
     }
+    if config.multiplexer.initial_batch_size == 0 {
+        errors.push("multiplexer.initial_batch_size must be greater than 0".to_string());
+    }
 
     // Validate retry values
     if config.retry.per_attempt_cap_ms == 0 {
@@ -418,6 +445,58 @@ mod tests {
         let mut f = NamedTempFile::new().expect("failed to create temp file");
         f.write_all(content.as_bytes()).expect("failed to write");
         f
+    }
+
+    // ── Story #11: MultiplexerConfig new fields ──────────────────────────────
+
+    #[test]
+    fn test_multiplexer_config_initial_batch_size_default() {
+        let config = MultiplexerConfig::default();
+        assert_eq!(config.initial_batch_size, 32, "initial_batch_size default must be 32");
+    }
+
+    #[test]
+    fn test_multiplexer_config_initial_batch_size_from_toml() {
+        let content = r#"
+[multiplexer]
+batch_window_ms = 50
+channel_capacity = 1024
+initial_batch_size = 16
+"#;
+        let config: Config = toml::from_str(content).expect("should parse");
+        assert_eq!(config.multiplexer.initial_batch_size, 16);
+    }
+
+    #[test]
+    fn test_multiplexer_config_success_streak_threshold_default() {
+        let config = MultiplexerConfig::default();
+        assert_eq!(config.success_streak_threshold, 10, "success_streak_threshold default must be 10");
+    }
+
+    #[test]
+    fn test_multiplexer_config_success_streak_threshold_from_toml() {
+        let content = r#"
+[multiplexer]
+batch_window_ms = 50
+channel_capacity = 1024
+success_streak_threshold = 5
+"#;
+        let config: Config = toml::from_str(content).expect("should parse");
+        assert_eq!(config.multiplexer.success_streak_threshold, 5);
+    }
+
+    #[test]
+    fn test_validate_config_zero_initial_batch_size_fails() {
+        let mut config = Config::default();
+        config.multiplexer.initial_batch_size = 0;
+        let result = validate_config(&config);
+        assert!(result.is_err(), "initial_batch_size=0 must fail validation");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("initial_batch_size"),
+            "error must mention initial_batch_size: {}",
+            err
+        );
     }
 
     // ── Default config template ──────────────────────────────────────────────

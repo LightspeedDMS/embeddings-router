@@ -7,6 +7,10 @@ use std::time::Instant;
 ///
 /// Tracks per-caller ranges so results can be demultiplexed after the
 /// provider responds.
+///
+/// Two capacity thresholds are maintained:
+/// - `flush_threshold` (K): when `texts.len() >= flush_threshold`, `should_flush()` returns true.
+/// - `hard_max`: callers are rejected when adding would exceed this limit.
 pub struct BatchAccumulator {
     /// All accumulated texts (from all callers).
     pub texts: Vec<String>,
@@ -14,18 +18,36 @@ pub struct BatchAccumulator {
     pub caller_ranges: Vec<(usize, Range<usize>)>,
     /// Time when the first text was added (used to enforce batch_window_ms).
     pub deadline: Instant,
-    /// Maximum texts per batch (from provider config).
-    pub max_texts: usize,
+    /// Soft flush trigger: when texts.len() >= flush_threshold, should_flush() returns true.
+    pub flush_threshold: usize,
+    /// Hard capacity cap: add_caller rejects texts that would push len() above this.
+    pub hard_max: usize,
 }
 
 impl BatchAccumulator {
-    /// Create a new empty accumulator.
+    /// Create a new empty accumulator where flush_threshold == hard_max.
+    /// Preserves backwards-compatible behaviour.
     pub fn new(max_texts: usize, deadline: Instant) -> Self {
+        Self::new_with_threshold(max_texts, max_texts, deadline)
+    }
+
+    /// Create a new accumulator with separate flush_threshold (K) and hard_max.
+    ///
+    /// # Panics
+    /// Panics if `flush_threshold > hard_max`.
+    pub fn new_with_threshold(flush_threshold: usize, hard_max: usize, deadline: Instant) -> Self {
+        assert!(
+            flush_threshold <= hard_max,
+            "flush_threshold ({}) must be <= hard_max ({})",
+            flush_threshold,
+            hard_max
+        );
         Self {
             texts: Vec::new(),
             caller_ranges: Vec::new(),
             deadline,
-            max_texts,
+            flush_threshold,
+            hard_max,
         }
     }
 
@@ -39,16 +61,22 @@ impl BatchAccumulator {
         self.texts.len()
     }
 
-    /// Returns true if adding `count` more texts would exceed `max_texts`.
+    /// Returns true when the batch has reached the soft flush threshold.
+    /// The mux loop should flush the slot when this returns true.
+    pub fn should_flush(&self) -> bool {
+        self.texts.len() >= self.flush_threshold
+    }
+
+    /// Returns true if adding `count` more texts would exceed `hard_max`.
     pub fn would_overflow(&self, count: usize) -> bool {
-        self.texts.len() + count > self.max_texts
+        self.texts.len() + count > self.hard_max
     }
 
     /// Add texts from a caller and record their range.
     ///
-    /// Returns `false` if adding these texts would exceed `max_texts`, `true` on success.
+    /// Returns `false` if adding these texts would exceed `hard_max`, `true` on success.
     pub fn add_caller(&mut self, caller_id: usize, texts: Vec<String>) -> bool {
-        if self.texts.len() + texts.len() > self.max_texts {
+        if self.texts.len() + texts.len() > self.hard_max {
             return false;
         }
         let start = self.texts.len();
@@ -79,6 +107,85 @@ mod tests {
 
     fn make_acc(max_texts: usize) -> BatchAccumulator {
         BatchAccumulator::new(max_texts, Instant::now() + Duration::from_millis(50))
+    }
+
+    fn make_acc_dual(flush_threshold: usize, hard_max: usize) -> BatchAccumulator {
+        BatchAccumulator::new_with_threshold(
+            flush_threshold,
+            hard_max,
+            Instant::now() + Duration::from_millis(50),
+        )
+    }
+
+    // ── Story #11: flush_threshold vs hard_max split ─────────────────────────
+
+    #[test]
+    fn test_accumulator_flush_threshold_vs_hard_max_construction() {
+        let acc = make_acc_dual(4, 8);
+        assert_eq!(acc.flush_threshold, 4);
+        assert_eq!(acc.hard_max, 8);
+    }
+
+    #[test]
+    fn test_accumulator_should_flush_at_threshold() {
+        let mut acc = make_acc_dual(3, 8);
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert!(acc.should_flush(), "should flush when texts.len() >= flush_threshold");
+    }
+
+    #[test]
+    fn test_accumulator_should_flush_below_threshold() {
+        let mut acc = make_acc_dual(4, 8);
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string()]));
+        assert!(!acc.should_flush(), "should NOT flush when texts.len() < flush_threshold");
+    }
+
+    #[test]
+    fn test_accumulator_would_overflow_uses_hard_max() {
+        let mut acc = make_acc_dual(3, 6);
+        // Add 4 texts — above flush_threshold but below hard_max
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]));
+        // Adding 3 more would exceed hard_max=6 (4+3=7 > 6)
+        assert!(acc.would_overflow(3), "would_overflow uses hard_max not flush_threshold");
+        // Adding 2 more is fine (4+2=6 == hard_max, not overflow)
+        assert!(!acc.would_overflow(2), "4+2=6 exactly equals hard_max, not overflow");
+    }
+
+    #[test]
+    fn test_accumulator_add_caller_respects_hard_max() {
+        let mut acc = make_acc_dual(3, 5);
+        // Fill to exactly hard_max
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string(), "e".to_string()]));
+        // Adding even 1 more must fail
+        assert!(!acc.add_caller(1, vec!["f".to_string()]), "add_caller must reject when hard_max exceeded");
+    }
+
+    #[test]
+    fn test_accumulator_add_caller_allows_above_threshold_below_max() {
+        let mut acc = make_acc_dual(2, 6);
+        // Add 3 texts — above flush_threshold=2 but below hard_max=6
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+        assert_eq!(acc.len(), 3);
+        // should_flush is true (3 >= 2) but add_caller should have succeeded
+        assert!(acc.should_flush());
+    }
+
+    #[test]
+    fn test_accumulator_flush_threshold_equals_hard_max() {
+        // When flush_threshold == hard_max, behavior is same as before
+        let mut acc = make_acc_dual(4, 4);
+        assert!(acc.add_caller(0, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]));
+        assert!(acc.should_flush());
+        assert!(!acc.would_overflow(0));
+        assert!(acc.would_overflow(1));
+    }
+
+    #[test]
+    fn test_accumulator_flush_threshold_one() {
+        // flush_threshold=1 means flush after every single text
+        let mut acc = make_acc_dual(1, 4);
+        assert!(acc.add_caller(0, vec!["a".to_string()]));
+        assert!(acc.should_flush(), "flush_threshold=1: flush after first text");
     }
 
     #[test]

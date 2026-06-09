@@ -190,7 +190,7 @@ async fn send_req(
 async fn test_multiplexer_single_caller_gets_result() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -211,7 +211,7 @@ async fn test_multiplexer_single_caller_gets_result() {
 async fn test_multiplexer_demux_correct_slice() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -249,7 +249,7 @@ async fn test_multiplexer_capacity_flush() {
     let registry = build_registry(3);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window — only capacity flush should trigger.
-    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -269,7 +269,7 @@ async fn test_multiplexer_graceful_shutdown() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window so only shutdown triggers the flush.
-    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(MuxRequest {
@@ -328,7 +328,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // 20ms window — well within the test timeout.
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let handles: Vec<_> = (0..3)
         .map(|i| {
@@ -356,7 +356,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
 async fn test_multiplexer_multi_provider_any() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -379,7 +379,7 @@ async fn test_multiplexer_multi_provider_any() {
 async fn test_multiplexer_multi_provider_all_one_fails() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -415,7 +415,7 @@ async fn test_multiplexer_multi_provider_all_one_fails() {
 async fn test_multiplexer_provider_failure_in_failed_map() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -439,7 +439,7 @@ async fn test_multiplexer_provider_failure_in_failed_map() {
 async fn test_multiplexer_batch_sub_requests_same_mux() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -468,7 +468,7 @@ async fn test_multiplexer_overflow_splits_correctly() {
     // Max 2 texts; first caller takes 2 → slot full → second goes to new slot.
     let registry = build_registry(2);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let r1 = send_req(
         &tx,
@@ -525,7 +525,7 @@ async fn build_sinbin_registry_and_tracker() -> (Arc<ProviderRegistry>, HealthTr
 async fn test_sinbinned_provider_skipped_for_any_policy() {
     let (registry, tracker) = build_sinbin_registry_and_tracker().await;
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -555,7 +555,7 @@ async fn test_sinbinned_provider_skipped_for_any_policy() {
 async fn test_sinbinned_provider_still_attempted_for_all_policy() {
     let (registry, tracker) = build_sinbin_registry_and_tracker().await;
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -606,7 +606,7 @@ async fn test_all_providers_sinbinned_any_policy_still_attempts() {
     let registry = Arc::new(reg);
 
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
@@ -626,6 +626,209 @@ async fn test_all_providers_sinbinned_any_policy_still_attempts() {
     );
 }
 
+// ── Story #11: Non-blocking parallel flush tests ──────────────────────────────
+
+/// A provider that introduces a configurable delay before responding.
+/// Used to verify that the mux loop doesn't block while a flush is in progress.
+struct SlowProvider {
+    name: String,
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl EmbeddingProvider for SlowProvider {
+    async fn embed_batch(&self, texts: &[String]) -> Result<EmbeddingBatch, ProviderError> {
+        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        Ok(EmbeddingBatch {
+            embeddings: texts.iter().map(|_| vec![0.1_f32, 0.2]).collect(),
+            total_tokens: Some(texts.len() as u32),
+        })
+    }
+    async fn health_probe(&self) -> Result<(), ProviderError> { Ok(()) }
+    fn name(&self) -> &str { &self.name }
+    fn max_texts_per_request(&self) -> usize { 128 }
+    fn model(&self) -> &str { "slow-model" }
+}
+
+/// AC1 (Story #11): After a capacity flush triggers, the mux loop returns
+/// immediately and can accept new requests while the spawned task is in-flight.
+///
+/// With the old blocking design, this test would deadlock or time out because
+/// the mux loop would be stuck awaiting the slow provider.
+#[tokio::test]
+async fn test_multiplexer_flush_is_nonblocking() {
+    let mut reg = ProviderRegistry::new();
+    // SlowProvider takes 100ms to respond — long enough that the mux loop
+    // would block for 100ms with the old design.
+    reg.register(
+        "slow-p".to_string(),
+        Arc::new(SlowProvider { name: "slow-p".to_string(), delay_ms: 100 }),
+    );
+    let registry = Arc::new(reg);
+
+    let (tx, rx) = mpsc::channel(1024);
+    // Use initial_batch_size=1 so the first request triggers an immediate capacity flush.
+    tokio::spawn(run_multiplexer(
+        rx,
+        registry,
+        60_000,           // very long window — only capacity flush triggers
+        no_retry_config(),
+        HealthTracker::with_defaults(),
+        Duration::from_secs(30),
+        1,                // initial_batch_size = 1 (flush immediately)
+    ));
+
+    // Send first request — triggers capacity flush (spawned task takes 100ms)
+    let (resp_tx1, resp_rx1) = oneshot::channel();
+    tx.send(MuxRequest {
+        texts: vec!["first".to_string()],
+        providers: vec!["slow-p".to_string()],
+        policy: RoutingPolicy::Any,
+        response_tx: resp_tx1,
+    }).await.expect("send ok");
+
+    // Send second request immediately — with non-blocking design the mux loop
+    // should accept this even while the first batch is in-flight.
+    // With blocking design, this would time out because the loop is stuck.
+    let (resp_tx2, resp_rx2) = oneshot::channel();
+    tokio::time::timeout(Duration::from_millis(50), tx.send(MuxRequest {
+        texts: vec!["second".to_string()],
+        providers: vec!["slow-p".to_string()],
+        policy: RoutingPolicy::Any,
+        response_tx: resp_tx2,
+    })).await
+        .expect("second send must not time out — mux loop is non-blocking")
+        .expect("channel send ok");
+
+    // Both requests should eventually complete.
+    let r1 = tokio::time::timeout(Duration::from_secs(2), resp_rx1)
+        .await.expect("resp1 timeout").expect("channel ok");
+    let r2 = tokio::time::timeout(Duration::from_secs(2), resp_rx2)
+        .await.expect("resp2 timeout").expect("channel ok");
+
+    assert!(r1.is_ok(), "first request must succeed: {:?}", r1);
+    assert!(r2.is_ok(), "second request must succeed: {:?}", r2);
+}
+
+/// AC3 (Story #11): Two flushes for the same provider run simultaneously.
+/// Both spawned tasks complete independently and both callers receive results.
+#[tokio::test]
+async fn test_multiplexer_parallel_flushes_same_provider() {
+    let mut reg = ProviderRegistry::new();
+    reg.register(
+        "par-p".to_string(),
+        Arc::new(SlowProvider { name: "par-p".to_string(), delay_ms: 50 }),
+    );
+    let registry = Arc::new(reg);
+
+    let (tx, rx) = mpsc::channel(1024);
+    // Use initial_batch_size=1 to trigger a flush on every single request.
+    tokio::spawn(run_multiplexer(
+        rx,
+        registry,
+        60_000,
+        no_retry_config(),
+        HealthTracker::with_defaults(),
+        Duration::from_secs(30),
+        1, // flush_threshold = 1
+    ));
+
+    // Send two requests concurrently — each should trigger its own flush task.
+    let (r1, r2) = tokio::join!(
+        send_req(&tx, vec!["a".to_string()], vec!["par-p".to_string()], RoutingPolicy::Any),
+        send_req(&tx, vec!["b".to_string()], vec!["par-p".to_string()], RoutingPolicy::Any),
+    );
+
+    assert!(r1.is_ok(), "parallel flush 1 must succeed: {:?}", r1);
+    assert!(r2.is_ok(), "parallel flush 2 must succeed: {:?}", r2);
+    assert_eq!(r1.unwrap().results["par-p"].embeddings.len(), 1);
+    assert_eq!(r2.unwrap().results["par-p"].embeddings.len(), 1);
+}
+
+/// AC4 (Story #11): Graceful shutdown flushes remaining slots and drains the
+/// JoinSet before the multiplexer task exits.
+#[tokio::test]
+async fn test_multiplexer_graceful_shutdown_drains_joinset() {
+    let mut reg = ProviderRegistry::new();
+    // 200ms delay — in-flight task still running when shutdown is triggered.
+    reg.register(
+        "drain-p".to_string(),
+        Arc::new(SlowProvider { name: "drain-p".to_string(), delay_ms: 200 }),
+    );
+    let registry = Arc::new(reg);
+
+    let (tx, rx) = mpsc::channel(1024);
+    // initial_batch_size=1 so first request spawns a task immediately.
+    let handle = tokio::spawn(run_multiplexer(
+        rx,
+        registry,
+        60_000,
+        no_retry_config(),
+        HealthTracker::with_defaults(),
+        Duration::from_secs(30),
+        1,
+    ));
+
+    // Send a request that triggers an in-flight task.
+    let (resp_tx, resp_rx) = oneshot::channel();
+    tx.send(MuxRequest {
+        texts: vec!["drain-test".to_string()],
+        providers: vec!["drain-p".to_string()],
+        policy: RoutingPolicy::Any,
+        response_tx: resp_tx,
+    }).await.expect("send ok");
+
+    // Give mux loop a moment to receive and spawn the task.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // Drop sender — triggers graceful shutdown. Mux must drain JoinSet.
+    drop(tx);
+
+    // Mux task must complete (drain joinset) within 5s.
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("multiplexer must exit within 5s after channel close")
+        .expect("task must not panic");
+
+    // The in-flight task result must have been delivered.
+    let resp = resp_rx.await.expect("response must be delivered");
+    let resp = resp.expect("no error on drain");
+    assert!(
+        resp.results.contains_key("drain-p"),
+        "in-flight result must be delivered on drain: {:?}", resp
+    );
+}
+
+/// AC2 (Story #11): `initial_batch_size` configures the flush threshold K.
+/// With K=4, flushing triggers at exactly 4 texts but NOT at 3.
+#[tokio::test]
+async fn test_multiplexer_flush_threshold_triggers_at_k() {
+    // Provider with max_texts_per_request = 128 (hard_max), initial_batch_size = 4 (K).
+    let registry = build_registry(128);
+    let (tx, rx) = mpsc::channel(1024);
+    // Very long window — only capacity flush (at K=4) triggers.
+    tokio::spawn(run_multiplexer(
+        rx,
+        registry,
+        60_000,
+        no_retry_config(),
+        HealthTracker::with_defaults(),
+        Duration::from_secs(30),
+        4, // initial_batch_size = 4
+    ));
+
+    // Send exactly 4 texts in one call — should trigger flush immediately.
+    let result = send_req(
+        &tx,
+        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()],
+        vec!["test-p".to_string()],
+        RoutingPolicy::Any,
+    ).await;
+
+    let resp = result.expect("flush at K=4 must succeed");
+    assert_eq!(resp.results["test-p"].embeddings.len(), 4);
+}
+
 /// Story #8 AC: Multiplexer retries transparently on 429 RateLimited.
 /// The provider returns 429 on first call, succeeds on second call.
 /// With max_retries=1, the multiplexer should return a successful response.
@@ -642,7 +845,7 @@ async fn test_multiplexer_retries_on_rate_limited() {
     let registry = Arc::new(reg);
 
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
+    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128));
 
     let result = send_req(
         &tx,
