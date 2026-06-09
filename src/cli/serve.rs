@@ -117,6 +117,7 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         health_tracker.clone(),
         Duration::from_secs(config.health.recovery_probe_interval_seconds),
         config.multiplexer.initial_batch_size,
+        config.multiplexer.success_streak_threshold,
     ));
 
     let state = AppState {

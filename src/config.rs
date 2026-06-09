@@ -383,6 +383,9 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
     if config.multiplexer.initial_batch_size == 0 {
         errors.push("multiplexer.initial_batch_size must be greater than 0".to_string());
     }
+    if config.multiplexer.success_streak_threshold == 0 {
+        errors.push("multiplexer.success_streak_threshold must be greater than 0".to_string());
+    }
 
     // Validate retry values
     if config.retry.per_attempt_cap_ms == 0 {

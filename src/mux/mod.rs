@@ -1,4 +1,5 @@
 pub mod accumulator;
+pub mod adaptive;
 pub mod multiplexer;
 pub mod policy;
 

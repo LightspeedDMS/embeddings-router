@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::health::HealthTracker;
 use crate::mux::accumulator::BatchAccumulator;
+use crate::mux::adaptive::AdaptiveKRegistry;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
 use crate::provider::registry::ProviderRegistry;
@@ -71,8 +72,8 @@ pub(crate) struct MuxState {
     pub(crate) recovery_probe_interval: Duration,
     /// JoinSet collecting results from all in-flight flush tasks.
     pub(crate) flush_tasks: JoinSet<FlushOutcome>,
-    /// Soft flush threshold K: flush a slot when it reaches this many texts.
-    pub(crate) initial_batch_size: usize,
+    /// Per-provider adaptive K registry (AIMD feedback).
+    pub(crate) adaptive_k: AdaptiveKRegistry,
 }
 
 impl MuxState {
@@ -83,6 +84,7 @@ impl MuxState {
         health_tracker: HealthTracker,
         recovery_probe_interval: Duration,
         initial_batch_size: usize,
+        success_streak_threshold: u32,
     ) -> Self {
         Self {
             slots: HashMap::new(),
@@ -93,7 +95,7 @@ impl MuxState {
             health_tracker,
             recovery_probe_interval,
             flush_tasks: JoinSet::new(),
-            initial_batch_size,
+            adaptive_k: AdaptiveKRegistry::new(initial_batch_size, success_streak_threshold),
         }
     }
 
@@ -122,6 +124,7 @@ impl MuxState {
 /// so the loop immediately returns to processing new requests.
 /// On channel close (all senders dropped) flushes all pending slots before
 /// draining the JoinSet and returning (graceful shutdown).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_multiplexer(
     mut rx: mpsc::Receiver<MuxRequest>,
     providers: Arc<ProviderRegistry>,
@@ -130,6 +133,7 @@ pub async fn run_multiplexer(
     health_tracker: HealthTracker,
     recovery_probe_interval: Duration,
     initial_batch_size: usize,
+    success_streak_threshold: u32,
 ) {
     let batch_window = Duration::from_millis(batch_window_ms);
     let retry_config = Arc::new(retry_config);
@@ -140,6 +144,7 @@ pub async fn run_multiplexer(
         health_tracker,
         recovery_probe_interval,
         initial_batch_size,
+        success_streak_threshold,
     );
 
     loop {
@@ -278,6 +283,26 @@ pub(crate) async fn handle_flush_outcome(outcome: FlushOutcome, state: &mut MuxS
                     );
                 }
             }
+        }
+    }
+
+    // AIMD feedback: update per-provider adaptive K based on the flush result.
+    // Must borrow `result` here BEFORE the destructive match below moves it.
+    {
+        let hard_max = state.providers.get(&provider_name)
+            .map(|p| p.max_texts_per_request())
+            .unwrap_or(DEFAULT_MAX_TEXTS_PER_REQUEST);
+        let adaptive_state = state.adaptive_k.get_or_create(&provider_name, hard_max);
+        match &result {
+            Ok(_) => {
+                adaptive_state.write().unwrap().record_success(
+                    state.adaptive_k.success_streak_threshold,
+                );
+            }
+            Err(ProviderError::RateLimited { .. }) => {
+                adaptive_state.write().unwrap().record_terminal_429(hard_max);
+            }
+            Err(_) => {} // Non-429 error: no K adjustment, no streak reset
         }
     }
 
@@ -427,8 +452,8 @@ pub(crate) fn add_to_slot(
         .map(|p| p.max_texts_per_request())
         .unwrap_or(DEFAULT_MAX_TEXTS_PER_REQUEST);
 
-    // flush_threshold (K) is initial_batch_size, capped at hard_max.
-    let flush_threshold = state.initial_batch_size.min(hard_max);
+    // flush_threshold (K) is the current adaptive K for this provider, capped at hard_max.
+    let flush_threshold = state.adaptive_k.current_k(provider_name).min(hard_max);
 
     // If the slot would overflow hard_max, flush it first.
     if let Some(slot) = state.slots.get(provider_name) {
