@@ -1,15 +1,48 @@
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::mux::{MuxError, MuxRequest};
+use crate::mux::{MuxError, MuxFailure, MuxRequest};
 use crate::mux::policy::RoutingPolicy;
 use crate::server::{middleware::auth::CallerAuth, AppState};
+
+/// Build a `Retry-After` header map with a ceiling integer value.
+/// Returns `None` if `retry_after` is `None`.
+fn retry_after_headers(retry_after: Option<f64>) -> Option<HeaderMap> {
+    retry_after.map(|secs| {
+        let ceiled = secs.ceil() as u64;
+        let mut headers = HeaderMap::new();
+        // SAFETY: ceiled u64 formatted as decimal is always valid ASCII
+        headers.insert(
+            axum::http::header::RETRY_AFTER,
+            HeaderValue::from_str(&ceiled.to_string()).unwrap_or(HeaderValue::from_static("1")),
+        );
+        headers
+    })
+}
+
+/// Scan all failures for rate-limiting. Returns `(any_rate_limited, max_retry_after)`.
+fn check_rate_limited(failed: &std::collections::HashMap<String, MuxFailure>) -> (bool, Option<f64>) {
+    let mut has_rate_limited = false;
+    let mut max_retry_after: Option<f64> = None;
+    for failure in failed.values() {
+        if failure.is_rate_limited() {
+            has_rate_limited = true;
+            if let Some(ra) = failure.retry_after() {
+                max_retry_after = Some(match max_retry_after {
+                    Some(current) => current.max(ra),
+                    None => ra,
+                });
+            }
+        }
+    }
+    (has_rate_limited, max_retry_after)
+}
 
 // ── Request / response types ─────────────────────────────────────────────────
 
@@ -185,15 +218,15 @@ pub async fn embed(
                             .into_response()
                     } else {
                         // Provider ended up in the failed map
-                        let msg = resp
-                            .failed
-                            .get(&provider_name)
-                            .cloned()
+                        let failure = resp.failed.get(&provider_name);
+                        let msg = failure
+                            .map(|f| f.message().to_string())
                             .unwrap_or_else(|| "provider returned no result".to_string());
 
                         // Propagate 429 if the provider was rate-limited.
-                        if msg.contains("rate-limited (429)") {
-                            return (
+                        if failure.map(|f| f.is_rate_limited()).unwrap_or(false) {
+                            let retry_after = failure.and_then(|f| f.retry_after());
+                            let mut response = (
                                 StatusCode::TOO_MANY_REQUESTS,
                                 Json(serde_json::json!({
                                     "error": {
@@ -203,6 +236,10 @@ pub async fn embed(
                                 })),
                             )
                                 .into_response();
+                            if let Some(headers) = retry_after_headers(retry_after) {
+                                response.headers_mut().extend(headers);
+                            }
+                            return response;
                         }
 
                         (
@@ -349,12 +386,13 @@ pub async fn embed(
                 );
             }
 
-            for (name, msg) in &mux_resp.failed {
+            for (name, failure) in &mux_resp.failed {
+                let error_type = if failure.is_rate_limited() { "rate_limited" } else { "provider_error" };
                 failed.insert(
                     name.clone(),
                     serde_json::json!({
-                        "type": "provider_error",
-                        "message": msg
+                        "type": error_type,
+                        "message": failure.message()
                     }),
                 );
             }
@@ -363,11 +401,18 @@ pub async fn embed(
             match policy {
                 RoutingPolicy::All => {
                     if !failed.is_empty() {
-                        return (
-                            StatusCode::BAD_GATEWAY,
+                        // If any failure was caused by rate-limiting, return 429.
+                        let (is_rl, retry_after) = check_rate_limited(&mux_resp.failed);
+                        let (status, error_type) = if is_rl {
+                            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+                        } else {
+                            (StatusCode::BAD_GATEWAY, "policy_failure")
+                        };
+                        let mut response = (
+                            status,
                             Json(serde_json::json!({
                                 "error": {
-                                    "type": "policy_failure",
+                                    "type": error_type,
                                     "message": "not all providers succeeded"
                                 },
                                 "results": results,
@@ -375,21 +420,40 @@ pub async fn embed(
                             })),
                         )
                             .into_response();
+                        if is_rl {
+                            if let Some(headers) = retry_after_headers(retry_after) {
+                                response.headers_mut().extend(headers);
+                            }
+                        }
+                        return response;
                     }
                 }
                 RoutingPolicy::Any => {
                     if results.is_empty() {
-                        return (
-                            StatusCode::BAD_GATEWAY,
+                        // If any failure was caused by rate-limiting, return 429.
+                        let (is_rl, retry_after) = check_rate_limited(&mux_resp.failed);
+                        let (status, error_type) = if is_rl {
+                            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+                        } else {
+                            (StatusCode::BAD_GATEWAY, "all_providers_failed")
+                        };
+                        let mut response = (
+                            status,
                             Json(serde_json::json!({
                                 "error": {
-                                    "type": "all_providers_failed",
+                                    "type": error_type,
                                     "message": "all providers failed"
                                 },
                                 "failed": failed
                             })),
                         )
                             .into_response();
+                        if is_rl {
+                            if let Some(headers) = retry_after_headers(retry_after) {
+                                response.headers_mut().extend(headers);
+                            }
+                        }
+                        return response;
                     }
                 }
             }
@@ -539,20 +603,32 @@ pub async fn embed_batch(
                         usage,
                     });
                 } else {
-                    let msg = resp
-                        .failed
-                        .get(&provider_name)
-                        .cloned()
-                        .unwrap_or_else(|| "provider returned no result".to_string());
+                    let failure = resp.failed.get(&provider_name);
 
-                    // Propagate 429 if the provider was rate-limited.
-                    if msg.contains("rate-limited (429)") {
+                    if let Some(f) = failure {
+                        if f.is_rate_limited() {
+                            let mut response = (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(serde_json::json!({
+                                    "error": {
+                                        "type": "rate_limited",
+                                        "message": f.message()
+                                    }
+                                })),
+                            )
+                                .into_response();
+                            if let Some(headers) = retry_after_headers(f.retry_after()) {
+                                response.headers_mut().extend(headers);
+                            }
+                            return response;
+                        }
+
                         return (
-                            StatusCode::TOO_MANY_REQUESTS,
+                            StatusCode::BAD_GATEWAY,
                             Json(serde_json::json!({
                                 "error": {
-                                    "type": "rate_limited",
-                                    "message": msg
+                                    "type": "provider_error",
+                                    "message": f.message()
                                 }
                             })),
                         )
@@ -564,7 +640,7 @@ pub async fn embed_batch(
                         Json(serde_json::json!({
                             "error": {
                                 "type": "provider_error",
-                                "message": msg
+                                "message": "provider returned no result"
                             }
                         })),
                     )

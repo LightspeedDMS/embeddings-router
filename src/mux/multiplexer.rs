@@ -357,11 +357,11 @@ pub(crate) async fn handle_flush_outcome(outcome: FlushOutcome, state: &mut MuxS
             }
         }
         Err(e) => {
-            let err_msg = e.to_string();
+            let failure = crate::mux::MuxFailure::from_provider_error(&e);
             for (caller_id, _) in &caller_ranges {
                 if let Some(tx) = pending_senders.remove(caller_id) {
                     let mut resp = MuxResponse::empty();
-                    resp.failed.insert(provider_name.clone(), err_msg.clone());
+                    resp.failed.insert(provider_name.clone(), failure.clone());
                     let _ = tx.send(Ok(resp));
                 }
             }
@@ -422,7 +422,10 @@ fn handle_multi_provider(
                     Ok(resp) => resp,
                     Err(e) => {
                         let mut resp = MuxResponse::empty();
-                        resp.failed.insert(provider_name_clone, e.to_string());
+                        resp.failed.insert(
+                            provider_name_clone,
+                            crate::mux::MuxFailure::Other { message: e.to_string() },
+                        );
                         resp
                     }
                 };
@@ -448,7 +451,7 @@ async fn collect_multi_provider(
     response_tx: oneshot::Sender<Result<MuxResponse, MuxError>>,
 ) {
     let mut results: HashMap<String, crate::provider::EmbeddingBatch> = HashMap::new();
-    let mut failed: HashMap<String, String> = HashMap::new();
+    let mut failed: HashMap<String, crate::mux::MuxFailure> = HashMap::new();
 
     while let Some(partial) = partial_rx.recv().await {
         for (k, v) in partial.results {
