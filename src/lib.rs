@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod health;
 pub mod mux;
 pub mod provider;
 pub mod retry;

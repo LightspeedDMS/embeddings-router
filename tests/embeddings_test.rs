@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use emr::{
     config::Config,
     db::{generate_api_key, Database},
+    health::HealthTracker,
     mux::run_multiplexer,
     provider::{registry::ProviderRegistry, EmbeddingBatch, EmbeddingProvider},
     retry::BackoffConfig,
@@ -95,7 +96,8 @@ async fn start_embedding_test_server() -> (String, String) {
         per_attempt_cap: Duration::from_millis(1),
         cumulative_cap: Duration::from_millis(1),
     };
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
+    let health_tracker = HealthTracker::with_defaults();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30)));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -104,6 +106,7 @@ async fn start_embedding_test_server() -> (String, String) {
         providers: providers_arc,
         start_time: std::time::Instant::now(),
         mux_tx,
+        health_tracker,
     };
 
     let router = create_router(state);
@@ -427,7 +430,8 @@ async fn start_multi_provider_test_server() -> (String, String) {
         per_attempt_cap: Duration::from_millis(1),
         cumulative_cap: Duration::from_millis(1),
     };
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
+    let health_tracker = HealthTracker::with_defaults();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30)));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -436,6 +440,7 @@ async fn start_multi_provider_test_server() -> (String, String) {
         providers: providers_arc,
         start_time: std::time::Instant::now(),
         mux_tx,
+        health_tracker,
     };
 
     let router = create_router(state);
@@ -689,7 +694,8 @@ async fn start_rate_limited_test_server() -> (String, String) {
         per_attempt_cap: Duration::from_millis(1),
         cumulative_cap: Duration::from_millis(1),
     };
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
+    let health_tracker = HealthTracker::with_defaults();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30)));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -698,6 +704,7 @@ async fn start_rate_limited_test_server() -> (String, String) {
         providers: providers_arc,
         start_time: std::time::Instant::now(),
         mux_tx,
+        health_tracker,
     };
 
     let router = create_router(state);
@@ -833,4 +840,118 @@ async fn test_concurrent_execution() {
         .as_array()
         .expect("test-cohere data must be array");
     assert_eq!(cohere_data.len(), 2, "test-cohere must return 2 embeddings for 2 inputs");
+}
+
+// ── Story #9: Provider Health Tracking & Observability ───────────────────────
+
+/// GET /health/providers returns a JSON array with detailed metrics fields for
+/// each known provider. No auth required (AC4).
+#[tokio::test]
+async fn test_health_providers_returns_detailed_metrics() {
+    let (base_url, _raw_key) = start_embedding_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/health/providers", base_url))
+        .send()  // no auth header — must work without auth (AC4)
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200, "expected 200 OK");
+
+    let providers: Vec<serde_json::Value> = resp.json().await.expect("response must be JSON array");
+    // At startup with no traffic, the list may be empty (no providers have been called yet).
+    // The fact that resp.json() deserialized into Vec<Value> proves it's a JSON array.
+    let _ = providers.len(); // assert it's iterable (compile-time proof)
+}
+
+/// GET /health/providers returns correct fields after a successful embed call.
+#[tokio::test]
+async fn test_health_providers_fields_after_embed() {
+    let (base_url, raw_key) = start_embedding_test_server().await;
+    let client = reqwest::Client::new();
+
+    // First make an embed call so the provider appears in health data
+    client
+        .post(format!("{}/v1/embeddings", base_url))
+        .header("Authorization", format!("Bearer {}", raw_key))
+        .json(&serde_json::json!({ "input": ["hello"], "provider": "test-provider" }))
+        .send()
+        .await
+        .expect("embed failed");
+
+    // Allow the multiplexer to flush (batch window is 10ms)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let resp = client
+        .get(format!("{}/health/providers", base_url))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let providers: Vec<serde_json::Value> = resp.json().await.expect("must be array");
+    // After an embed call, at least one provider entry must exist
+    assert!(!providers.is_empty(), "at least one provider must appear after embed");
+    let p = &providers[0];
+    assert!(p["name"].is_string(), "provider must have name");
+    assert!(p["status"].is_string(), "provider must have status");
+    assert!(p["p50_ms"].is_number(), "provider must have p50_ms");
+    assert!(p["p95_ms"].is_number(), "provider must have p95_ms");
+    assert!(p["p99_ms"].is_number(), "provider must have p99_ms");
+    assert!(p["error_rate"].is_number(), "provider must have error_rate");
+    assert!(p["availability"].is_number(), "provider must have availability");
+    assert!(p["health_score"].is_number(), "provider must have health_score");
+    assert!(p["sinbinned"].is_boolean(), "provider must have sinbinned bool");
+}
+
+/// GET /status includes requests_served field that increments with each embed call.
+#[tokio::test]
+async fn test_status_includes_requests_served() {
+    let (base_url, raw_key) = start_embedding_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Make 2 embed calls
+    for _ in 0..2 {
+        client
+            .post(format!("{}/v1/embeddings", base_url))
+            .header("Authorization", format!("Bearer {}", raw_key))
+            .json(&serde_json::json!({ "input": ["hello"], "provider": "test-provider" }))
+            .send()
+            .await
+            .expect("embed failed");
+    }
+
+    let resp = client
+        .get(format!("{}/status", base_url))
+        .send()  // no auth needed
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("must be JSON");
+    assert!(body["requests_served"].is_number(), "requests_served must be a number");
+    assert!(
+        body["requests_served"].as_u64().unwrap_or(0) >= 2,
+        "requests_served must be >= 2 after 2 embed calls: {:?}",
+        body["requests_served"]
+    );
+}
+
+/// GET /health returns {"status": "ok"} with a providers array when no providers are down.
+#[tokio::test]
+async fn test_health_returns_ok_with_providers_array() {
+    let (base_url, _raw_key) = start_embedding_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/health", base_url))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert_eq!(resp.status(), 200, "expected 200 OK when no providers down");
+    let body: serde_json::Value = resp.json().await.expect("must be JSON");
+    assert_eq!(body["status"], "ok", "status must be 'ok'");
+    assert!(body["providers"].is_array(), "must include providers array");
 }

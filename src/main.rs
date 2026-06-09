@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use emr::cli::config_cmd::{cmd_config_init, cmd_config_show, cmd_config_validate};
+use emr::cli::health_cmd::cmd_health;
 use emr::cli::serve::cmd_serve;
+use emr::cli::status::cmd_status;
 use emr::error;
 
 /// Embeddings Router — a unified routing and multiplexing layer for embedding providers.
@@ -43,10 +45,18 @@ enum Commands {
     },
 
     /// Show router status
-    Status,
+    Status {
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+    },
 
     /// Show provider health
-    Health,
+    Health {
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+    },
 
     /// Start the router (alias for serve with daemon mode)
     Up,
@@ -234,13 +244,13 @@ async fn dispatch(command: Commands) -> Result<(), error::ConfigError> {
             ConfigCommands::Validate { config } => cmd_config_validate(&config),
         },
 
-        Commands::Status => {
-            println!("status: not yet implemented");
+        Commands::Status { server } => {
+            cmd_status(&server).await?;
             Ok(())
         }
 
-        Commands::Health => {
-            println!("health: not yet implemented");
+        Commands::Health { server } => {
+            cmd_health(&server).await?;
             Ok(())
         }
 

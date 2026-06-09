@@ -34,6 +34,26 @@ fn default_rolling_window_minutes() -> u64 {
     60
 }
 
+fn default_failure_threshold() -> u32 {
+    5
+}
+
+fn default_sinbin_initial_seconds() -> u64 {
+    30
+}
+
+fn default_sinbin_max_seconds() -> u64 {
+    600
+}
+
+fn default_sinbin_multiplier() -> f64 {
+    2.0
+}
+
+fn default_recovery_probe_interval_seconds() -> u64 {
+    30
+}
+
 fn default_db_path() -> String {
     "~/.config/emr/emr.db".to_string()
 }
@@ -95,12 +115,32 @@ impl Default for RetryConfig {
 pub struct HealthConfig {
     #[serde(default = "default_rolling_window_minutes")]
     pub rolling_window_minutes: u64,
+    /// Number of consecutive failures before a provider is sin-binned.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    /// Initial sin-bin duration in seconds (grows exponentially on repeated failures).
+    #[serde(default = "default_sinbin_initial_seconds")]
+    pub sinbin_initial_seconds: u64,
+    /// Maximum sin-bin duration in seconds (caps the exponential backoff).
+    #[serde(default = "default_sinbin_max_seconds")]
+    pub sinbin_max_seconds: u64,
+    /// Exponential backoff multiplier applied on each successive sin-bin.
+    #[serde(default = "default_sinbin_multiplier")]
+    pub sinbin_multiplier: f64,
+    /// Interval in seconds between recovery probe attempts for sin-binned providers.
+    #[serde(default = "default_recovery_probe_interval_seconds")]
+    pub recovery_probe_interval_seconds: u64,
 }
 
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
             rolling_window_minutes: default_rolling_window_minutes(),
+            failure_threshold: default_failure_threshold(),
+            sinbin_initial_seconds: default_sinbin_initial_seconds(),
+            sinbin_max_seconds: default_sinbin_max_seconds(),
+            sinbin_multiplier: default_sinbin_multiplier(),
+            recovery_probe_interval_seconds: default_recovery_probe_interval_seconds(),
         }
     }
 }
@@ -166,6 +206,11 @@ cumulative_cap_ms = {cumulative_cap_ms}
 
 [health]
 rolling_window_minutes = {rolling_window_minutes}
+failure_threshold = {failure_threshold}
+sinbin_initial_seconds = {sinbin_initial_seconds}
+sinbin_max_seconds = {sinbin_max_seconds}
+sinbin_multiplier = {sinbin_multiplier}
+recovery_probe_interval_seconds = {recovery_probe_interval_seconds}
 
 [database]
 path = "{db_path}"
@@ -182,6 +227,11 @@ path = "{db_path}"
         per_attempt_cap_ms = default_per_attempt_cap_ms(),
         cumulative_cap_ms = default_cumulative_cap_ms(),
         rolling_window_minutes = default_rolling_window_minutes(),
+        failure_threshold = default_failure_threshold(),
+        sinbin_initial_seconds = default_sinbin_initial_seconds(),
+        sinbin_max_seconds = default_sinbin_max_seconds(),
+        sinbin_multiplier = default_sinbin_multiplier(),
+        recovery_probe_interval_seconds = default_recovery_probe_interval_seconds(),
         db_path = default_db_path(),
     )
 }
@@ -202,7 +252,14 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
 const KNOWN_SERVER_KEYS: &[&str] = &["bind"];
 const KNOWN_MULTIPLEXER_KEYS: &[&str] = &["batch_window_ms", "channel_capacity"];
 const KNOWN_RETRY_KEYS: &[&str] = &["max_retries", "per_attempt_cap_ms", "cumulative_cap_ms"];
-const KNOWN_HEALTH_KEYS: &[&str] = &["rolling_window_minutes"];
+const KNOWN_HEALTH_KEYS: &[&str] = &[
+    "rolling_window_minutes",
+    "failure_threshold",
+    "sinbin_initial_seconds",
+    "sinbin_max_seconds",
+    "sinbin_multiplier",
+    "recovery_probe_interval_seconds",
+];
 const KNOWN_DATABASE_KEYS: &[&str] = &["path"];
 const KNOWN_ADMIN_KEYS: &[&str] = &[];
 
@@ -317,6 +374,23 @@ pub fn validate_config(config: &Config) -> Result<(), ConfigError> {
     if config.health.rolling_window_minutes == 0 {
         errors.push("health.rolling_window_minutes must be greater than 0".to_string());
     }
+    if config.health.failure_threshold == 0 {
+        errors.push("health.failure_threshold must be greater than 0".to_string());
+    }
+    if config.health.sinbin_initial_seconds == 0 {
+        errors.push("health.sinbin_initial_seconds must be greater than 0".to_string());
+    }
+    if config.health.sinbin_max_seconds == 0 {
+        errors.push("health.sinbin_max_seconds must be greater than 0".to_string());
+    }
+    if config.health.sinbin_initial_seconds > config.health.sinbin_max_seconds {
+        errors.push(
+            "health.sinbin_initial_seconds must be <= health.sinbin_max_seconds".to_string(),
+        );
+    }
+    if config.health.recovery_probe_interval_seconds == 0 {
+        errors.push("health.recovery_probe_interval_seconds must be greater than 0".to_string());
+    }
 
     // Validate database path is non-empty
     if config.database.path.trim().is_empty() {
@@ -404,6 +478,75 @@ mod tests {
         assert_eq!(config.retry.cumulative_cap_ms, 45000);
         assert_eq!(config.health.rolling_window_minutes, 60);
         assert_eq!(config.database.path, "~/.config/emr/emr.db");
+    }
+
+    #[test]
+    fn test_health_config_new_fields_defaults() {
+        let h = HealthConfig::default();
+        assert_eq!(h.failure_threshold, 5, "failure_threshold default must be 5");
+        assert_eq!(h.sinbin_initial_seconds, 30, "sinbin_initial_seconds default must be 30");
+        assert_eq!(h.sinbin_max_seconds, 600, "sinbin_max_seconds default must be 600");
+        assert!((h.sinbin_multiplier - 2.0).abs() < f64::EPSILON, "sinbin_multiplier default must be 2.0");
+        assert_eq!(h.recovery_probe_interval_seconds, 30, "recovery_probe_interval_seconds default must be 30");
+    }
+
+    #[test]
+    fn test_health_config_new_fields_in_toml() {
+        let toml = default_config_toml();
+        assert!(toml.contains("failure_threshold"), "TOML template must include failure_threshold");
+        assert!(toml.contains("sinbin_initial_seconds"), "TOML template must include sinbin_initial_seconds");
+        assert!(toml.contains("sinbin_max_seconds"), "TOML template must include sinbin_max_seconds");
+        assert!(toml.contains("sinbin_multiplier"), "TOML template must include sinbin_multiplier");
+        assert!(toml.contains("recovery_probe_interval_seconds"), "TOML template must include recovery_probe_interval_seconds");
+    }
+
+    #[test]
+    fn test_health_config_new_fields_parsed_from_toml() {
+        let content = r#"
+[health]
+rolling_window_minutes = 30
+failure_threshold = 10
+sinbin_initial_seconds = 60
+sinbin_max_seconds = 1200
+sinbin_multiplier = 3.0
+recovery_probe_interval_seconds = 45
+"#;
+        let config: Config = toml::from_str(content).expect("should parse");
+        assert_eq!(config.health.rolling_window_minutes, 30);
+        assert_eq!(config.health.failure_threshold, 10);
+        assert_eq!(config.health.sinbin_initial_seconds, 60);
+        assert_eq!(config.health.sinbin_max_seconds, 1200);
+        assert!((config.health.sinbin_multiplier - 3.0).abs() < f64::EPSILON);
+        assert_eq!(config.health.recovery_probe_interval_seconds, 45);
+    }
+
+    #[test]
+    fn test_validate_config_zero_failure_threshold_fails() {
+        let mut config = Config::default();
+        config.health.failure_threshold = 0;
+        let result = validate_config(&config);
+        assert!(result.is_err(), "failure_threshold=0 must fail validation");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("failure_threshold"), "error must mention failure_threshold: {}", err);
+    }
+
+    #[test]
+    fn test_validate_config_zero_sinbin_initial_fails() {
+        let mut config = Config::default();
+        config.health.sinbin_initial_seconds = 0;
+        let result = validate_config(&config);
+        assert!(result.is_err(), "sinbin_initial_seconds=0 must fail validation");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("sinbin_initial_seconds"), "error must mention sinbin_initial_seconds: {}", err);
+    }
+
+    #[test]
+    fn test_validate_config_sinbin_initial_exceeds_max_fails() {
+        let mut config = Config::default();
+        config.health.sinbin_initial_seconds = 1000;
+        config.health.sinbin_max_seconds = 500;
+        let result = validate_config(&config);
+        assert!(result.is_err(), "sinbin_initial > sinbin_max must fail validation");
     }
 
     // ── load_config ──────────────────────────────────────────────────────────

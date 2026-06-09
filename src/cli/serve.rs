@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use std::time::Duration;
+
 use crate::{
     config::{load_config, Config},
     db::Database,
     error::ConfigError,
+    health::HealthTracker,
     provider::registry::ProviderRegistry,
     retry::BackoffConfig,
     server::{create_router, AppState},
@@ -97,11 +100,22 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
     let providers_arc = Arc::new(registry);
     let (mux_tx, mux_rx) = tokio::sync::mpsc::channel(config.multiplexer.channel_capacity);
     let retry_config = BackoffConfig::from_config(&config.retry);
+
+    let health_tracker = HealthTracker::new(
+        Duration::from_secs(config.health.rolling_window_minutes * 60),
+        config.health.failure_threshold,
+        Duration::from_secs(config.health.sinbin_initial_seconds),
+        Duration::from_secs(config.health.sinbin_max_seconds),
+        config.health.sinbin_multiplier,
+    );
+
     tokio::spawn(run_multiplexer(
         mux_rx,
         providers_arc.clone(),
         config.multiplexer.batch_window_ms,
         retry_config,
+        health_tracker.clone(),
+        Duration::from_secs(config.health.recovery_probe_interval_seconds),
     ));
 
     let state = AppState {
@@ -111,6 +125,7 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         providers: providers_arc,
         start_time: std::time::Instant::now(),
         mux_tx,
+        health_tracker,
     };
 
     let app = create_router(state);

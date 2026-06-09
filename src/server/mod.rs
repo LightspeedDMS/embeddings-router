@@ -10,7 +10,7 @@ use axum::{
 };
 use tokio::sync::Mutex;
 
-use crate::{config::Config, db::Database, provider::registry::ProviderRegistry};
+use crate::{config::Config, db::Database, health::HealthTracker, provider::registry::ProviderRegistry};
 
 // ── Application state ────────────────────────────────────────────────────────
 
@@ -29,6 +29,8 @@ pub struct AppState {
     pub start_time: std::time::Instant,
     /// Sender half of the multiplexer channel — handlers submit MuxRequests here.
     pub mux_tx: tokio::sync::mpsc::Sender<crate::mux::MuxRequest>,
+    /// Provider health tracker — records successes/failures and manages sin-bin state.
+    pub health_tracker: HealthTracker,
 }
 
 // ── Router factory ───────────────────────────────────────────────────────────

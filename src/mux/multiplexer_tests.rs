@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ProviderError;
+use crate::health::HealthTracker;
 use crate::mux::multiplexer::run_multiplexer;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
@@ -189,7 +190,7 @@ async fn send_req(
 async fn test_multiplexer_single_caller_gets_result() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,
@@ -210,7 +211,7 @@ async fn test_multiplexer_single_caller_gets_result() {
 async fn test_multiplexer_demux_correct_slice() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -248,7 +249,7 @@ async fn test_multiplexer_capacity_flush() {
     let registry = build_registry(3);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window — only capacity flush should trigger.
-    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,
@@ -268,7 +269,7 @@ async fn test_multiplexer_graceful_shutdown() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window so only shutdown triggers the flush.
-    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config()));
+    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(MuxRequest {
@@ -327,7 +328,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // 20ms window — well within the test timeout.
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let handles: Vec<_> = (0..3)
         .map(|i| {
@@ -355,7 +356,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
 async fn test_multiplexer_multi_provider_any() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,
@@ -378,7 +379,7 @@ async fn test_multiplexer_multi_provider_any() {
 async fn test_multiplexer_multi_provider_all_one_fails() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,
@@ -414,7 +415,7 @@ async fn test_multiplexer_multi_provider_all_one_fails() {
 async fn test_multiplexer_provider_failure_in_failed_map() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,
@@ -438,7 +439,7 @@ async fn test_multiplexer_provider_failure_in_failed_map() {
 async fn test_multiplexer_batch_sub_requests_same_mux() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -467,7 +468,7 @@ async fn test_multiplexer_overflow_splits_correctly() {
     // Max 2 texts; first caller takes 2 → slot full → second goes to new slot.
     let registry = build_registry(2);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let r1 = send_req(
         &tx,
@@ -489,6 +490,142 @@ async fn test_multiplexer_overflow_splits_correctly() {
     assert_eq!(r2.unwrap().results["test-p"].embeddings.len(), 1);
 }
 
+// ── Sin-bin filtering helpers ──────────────────────────────────────────────────
+
+/// Build a registry with a healthy provider ("healthy") and a sinbinned provider ("sinbinned").
+/// Pre-sinbin the "sinbinned" provider in the given HealthTracker.
+async fn build_sinbin_registry_and_tracker() -> (Arc<ProviderRegistry>, HealthTracker) {
+    let mut reg = ProviderRegistry::new();
+    reg.register(
+        "healthy".to_string(),
+        Arc::new(TestProvider { name: "healthy".to_string(), max_texts: 128 }),
+    );
+    reg.register(
+        "sinbinned".to_string(),
+        Arc::new(TestProvider { name: "sinbinned".to_string(), max_texts: 128 }),
+    );
+    let tracker = HealthTracker::new(
+        Duration::from_secs(3600),
+        5,
+        Duration::from_secs(60), // long sinbin so it won't expire during test
+        Duration::from_secs(600),
+        2.0,
+    );
+    // Force-sinbin "sinbinned" by recording 5 consecutive failures.
+    for _ in 0..5 {
+        tracker.record_failure("sinbinned", Duration::from_millis(10)).await;
+    }
+    assert!(tracker.is_sinbinned("sinbinned").await, "setup: provider must be sinbinned");
+    (Arc::new(reg), tracker)
+}
+
+/// AC6 sinbin: For "any" policy with 2 providers (one sinbinned), the sinbinned
+/// provider is skipped and only the healthy provider is used.
+#[tokio::test]
+async fn test_sinbinned_provider_skipped_for_any_policy() {
+    let (registry, tracker) = build_sinbin_registry_and_tracker().await;
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+
+    let result = send_req(
+        &tx,
+        vec!["hello".to_string()],
+        vec!["healthy".to_string(), "sinbinned".to_string()],
+        RoutingPolicy::Any,
+    )
+    .await;
+
+    let resp = result.expect("request must succeed");
+    // Only "healthy" should be in results — "sinbinned" was skipped.
+    assert!(
+        resp.results.contains_key("healthy"),
+        "healthy provider must serve the request: {:?}",
+        resp
+    );
+    assert!(
+        !resp.results.contains_key("sinbinned"),
+        "sinbinned provider must be skipped for 'any' policy: {:?}",
+        resp
+    );
+}
+
+/// AC6 sinbin: For "all" policy, sinbinned providers are NOT pre-filtered —
+/// all providers including sinbinned ones are still attempted.
+#[tokio::test]
+async fn test_sinbinned_provider_still_attempted_for_all_policy() {
+    let (registry, tracker) = build_sinbin_registry_and_tracker().await;
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+
+    let result = send_req(
+        &tx,
+        vec!["hello".to_string()],
+        vec!["healthy".to_string(), "sinbinned".to_string()],
+        RoutingPolicy::All,
+    )
+    .await;
+
+    // Both providers are attempted; since TestProvider always succeeds,
+    // both should appear in results.
+    let resp = result.expect("request must return a response");
+    assert!(
+        resp.results.contains_key("sinbinned"),
+        "sinbinned provider must still be attempted for 'all' policy: {:?}",
+        resp
+    );
+    assert!(
+        resp.results.contains_key("healthy"),
+        "healthy provider must also succeed for 'all' policy: {:?}",
+        resp
+    );
+}
+
+/// AC6 sinbin fallback: If ALL providers are sinbinned for "any" policy,
+/// the request is still attempted (no providers dropped → original list used).
+#[tokio::test]
+async fn test_all_providers_sinbinned_any_policy_still_attempts() {
+    let tracker = HealthTracker::new(
+        Duration::from_secs(3600),
+        5,
+        Duration::from_secs(60),
+        Duration::from_secs(600),
+        2.0,
+    );
+    // Sinbin both providers.
+    for _ in 0..5 {
+        tracker.record_failure("p1", Duration::from_millis(10)).await;
+        tracker.record_failure("p2", Duration::from_millis(10)).await;
+    }
+    assert!(tracker.is_sinbinned("p1").await);
+    assert!(tracker.is_sinbinned("p2").await);
+
+    // Both providers can still embed (TestProvider always succeeds).
+    let mut reg = ProviderRegistry::new();
+    reg.register("p1".to_string(), Arc::new(TestProvider { name: "p1".to_string(), max_texts: 128 }));
+    reg.register("p2".to_string(), Arc::new(TestProvider { name: "p2".to_string(), max_texts: 128 }));
+    let registry = Arc::new(reg);
+
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30)));
+
+    let result = send_req(
+        &tx,
+        vec!["hello".to_string()],
+        vec!["p1".to_string(), "p2".to_string()],
+        RoutingPolicy::Any,
+    )
+    .await;
+
+    let resp = result.expect("request must return a response even when all are sinbinned");
+    // When all providers are sinbinned, we fall back to attempting all of them.
+    // At least one must be in results (since TestProvider succeeds).
+    assert!(
+        resp.results.contains_key("p1") || resp.results.contains_key("p2"),
+        "fallback: at least one provider attempted when all sinbinned: {:?}",
+        resp
+    );
+}
+
 /// Story #8 AC: Multiplexer retries transparently on 429 RateLimited.
 /// The provider returns 429 on first call, succeeds on second call.
 /// With max_retries=1, the multiplexer should return a successful response.
@@ -505,7 +642,7 @@ async fn test_multiplexer_retries_on_rate_limited() {
     let registry = Arc::new(reg);
 
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config()));
+    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30)));
 
     let result = send_req(
         &tx,

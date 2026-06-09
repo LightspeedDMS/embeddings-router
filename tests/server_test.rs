@@ -8,6 +8,7 @@ use std::time::Duration;
 use emr::{
     config::Config,
     db::Database,
+    health::HealthTracker,
     mux::run_multiplexer,
     provider::registry::ProviderRegistry,
     retry::BackoffConfig,
@@ -27,7 +28,8 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         per_attempt_cap: Duration::from_millis(1),
         cumulative_cap: Duration::from_millis(1),
     };
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry));
+    let health_tracker = HealthTracker::with_defaults();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30)));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
@@ -35,6 +37,7 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         providers: providers_arc,
         start_time: std::time::Instant::now(),
         mux_tx,
+        health_tracker,
     };
     let router = create_router(state);
 

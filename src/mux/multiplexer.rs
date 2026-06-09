@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep_until;
 
+use crate::health::HealthTracker;
 use crate::mux::accumulator::BatchAccumulator;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
@@ -49,6 +50,8 @@ pub(crate) struct MuxState {
     pub(crate) batch_window: Duration,
     pub(crate) providers: Arc<ProviderRegistry>,
     pub(crate) retry_config: BackoffConfig,
+    pub(crate) health_tracker: HealthTracker,
+    pub(crate) recovery_probe_interval: Duration,
 }
 
 impl MuxState {
@@ -56,6 +59,8 @@ impl MuxState {
         batch_window: Duration,
         providers: Arc<ProviderRegistry>,
         retry_config: BackoffConfig,
+        health_tracker: HealthTracker,
+        recovery_probe_interval: Duration,
     ) -> Self {
         Self {
             slots: HashMap::new(),
@@ -63,6 +68,8 @@ impl MuxState {
             batch_window,
             providers,
             retry_config,
+            health_tracker,
+            recovery_probe_interval,
         }
     }
 
@@ -94,9 +101,11 @@ pub async fn run_multiplexer(
     providers: Arc<ProviderRegistry>,
     batch_window_ms: u64,
     retry_config: BackoffConfig,
+    health_tracker: HealthTracker,
+    recovery_probe_interval: Duration,
 ) {
     let batch_window = Duration::from_millis(batch_window_ms);
-    let mut state = MuxState::new(batch_window, providers, retry_config);
+    let mut state = MuxState::new(batch_window, providers, retry_config, health_tracker, recovery_probe_interval);
 
     loop {
         match state.earliest_deadline() {
@@ -130,13 +139,20 @@ pub async fn run_multiplexer(
 // ── Request handling ──────────────────────────────────────────────────────────
 
 pub(crate) async fn handle_request(req: MuxRequest, state: &mut MuxState) {
-    let MuxRequest { texts, providers: provider_names, policy, response_tx } = req;
+    let MuxRequest { texts, mut providers, policy, response_tx } = req;
 
-    if provider_names.len() == 1 {
+    state.health_tracker.increment_requests().await;
+
+    if providers.len() == 1 {
         let caller_id = state.alloc_id();
-        add_to_slot(caller_id, texts, &provider_names[0], response_tx, state).await;
+        add_to_slot(caller_id, texts, &providers[0], response_tx, state).await;
     } else {
-        handle_multi_provider(texts, provider_names, policy, response_tx, state).await;
+        // For "any" policy: skip sin-binned providers so healthy ones are preferred.
+        // "all" policy must attempt every provider, including sin-binned ones.
+        if policy == RoutingPolicy::Any {
+            providers = state.health_tracker.filter_available(&providers).await;
+        }
+        handle_multi_provider(texts, providers, policy, response_tx, state).await;
     }
 }
 
@@ -280,12 +296,31 @@ pub(crate) async fn flush_slot(provider_name: &str, state: &mut MuxState) {
         }
     };
 
+    let call_start = Instant::now();
     let result = execute_with_backoff(&state.retry_config, || {
         let p = provider.clone();
         let t = texts.clone();
         async move { p.embed_batch(&t).await }
     })
     .await;
+    let elapsed = call_start.elapsed();
+
+    // Record health metrics for this provider call.
+    match &result {
+        Ok(_) => {
+            state.health_tracker.record_success(provider_name, elapsed).await;
+        }
+        Err(_) => {
+            let just_sinbinned = state.health_tracker.record_failure(provider_name, elapsed).await;
+            if just_sinbinned {
+                state.health_tracker.spawn_recovery_probe(
+                    provider_name.to_string(),
+                    provider.clone(),
+                    state.recovery_probe_interval,
+                );
+            }
+        }
+    }
 
     let slot = state.slots.get_mut(provider_name).unwrap();
     match result {
