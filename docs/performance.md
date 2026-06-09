@@ -123,7 +123,7 @@ All sustained load tests use `scripts/sustained_load_test.sh`:
 - Each request sends 1 unique text for embedding
 - Metrics: per-request HTTP status code and latency, aggregated into percentiles and 1-second time-series buckets
 - Server: localhost:3200, single instance, release build
-- Baseline commit: `9a906e9` (pre-AIMD, fixed batch sizing)
+- Baseline: fixed batch sizing (no adaptive AIMD)
 
 Usage:
 ```bash
