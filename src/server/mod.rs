@@ -10,7 +10,13 @@ use axum::{
 };
 use tokio::sync::Mutex;
 
-use crate::{config::Config, db::Database, health::HealthTracker, provider::registry::ProviderRegistry};
+use crate::{
+    config::Config,
+    db::Database,
+    health::HealthTracker,
+    mux::adaptive_snapshot::SharedAdaptiveSnapshot,
+    provider::registry::ProviderRegistry,
+};
 
 // ── Application state ────────────────────────────────────────────────────────
 
@@ -31,6 +37,9 @@ pub struct AppState {
     pub mux_tx: tokio::sync::mpsc::Sender<crate::mux::MuxRequest>,
     /// Provider health tracker — records successes/failures and manages sin-bin state.
     pub health_tracker: HealthTracker,
+    /// Observability snapshot of per-provider adaptive batch state (written by mux loop,
+    /// read by health handlers). Uses std::sync::RwLock — lock times are microseconds.
+    pub adaptive_snapshot: SharedAdaptiveSnapshot,
 }
 
 // ── Router factory ───────────────────────────────────────────────────────────

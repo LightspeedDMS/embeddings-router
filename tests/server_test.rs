@@ -9,7 +9,7 @@ use emr::{
     config::Config,
     db::Database,
     health::HealthTracker,
-    mux::run_multiplexer,
+    mux::{adaptive_snapshot::new_shared_snapshot, run_multiplexer},
     provider::registry::ProviderRegistry,
     retry::BackoffConfig,
     server::{create_router, AppState},
@@ -29,7 +29,8 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10));
+    let adaptive_snapshot = new_shared_snapshot();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10, adaptive_snapshot.clone()));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
@@ -38,6 +39,7 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
     let router = create_router(state);
 
@@ -209,6 +211,84 @@ async fn test_add_provider_wrong_auth() {
         .expect("request failed");
 
     assert_eq!(resp.status(), 401, "expected 401 Unauthorized with wrong secret");
+}
+
+/// GET /health/providers returns per-provider adaptive batch state fields.
+///
+/// Acceptance criteria #4 and #5: current_batch_size_k, in_flight_batches,
+/// and recent_429_rate must be present; before AIMD adjusts K, current_batch_size_k
+/// equals initial_batch_size (32) and recent_429_rate is 0.0.
+#[tokio::test]
+async fn test_health_providers_includes_adaptive_fields() {
+    let (base_url, _handle) = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Add a provider so health/providers has at least one entry.
+    client
+        .post(format!("{}/admin/providers", base_url))
+        .header("Authorization", "Bearer test-secret")
+        .json(&voyage_provider_body("voyage-adaptive-test"))
+        .send()
+        .await
+        .expect("add provider request failed");
+
+    // GET /health/providers
+    let resp = client
+        .get(format!("{}/health/providers", base_url))
+        .send()
+        .await
+        .expect("health/providers request failed");
+
+    assert_eq!(resp.status(), 200, "expected 200 OK from health/providers");
+
+    let body: serde_json::Value = resp.json().await.expect("response is not JSON");
+    let arr = body.as_array().expect("health/providers should be a JSON array");
+    assert!(!arr.is_empty(), "array should contain the registered provider");
+
+    let provider = arr
+        .iter()
+        .find(|p| p["name"].as_str() == Some("voyage-adaptive-test"))
+        .expect("voyage-adaptive-test provider not found in health response");
+
+    // Adaptive fields must be present.
+    assert!(
+        provider.get("current_batch_size_k").is_some(),
+        "health response must include current_batch_size_k field; got: {}",
+        provider
+    );
+    assert!(
+        provider.get("in_flight_batches").is_some(),
+        "health response must include in_flight_batches field; got: {}",
+        provider
+    );
+    assert!(
+        provider.get("recent_429_rate").is_some(),
+        "health response must include recent_429_rate field; got: {}",
+        provider
+    );
+
+    // Acceptance criterion #5: before AIMD adjusts K, defaults must hold.
+    assert_eq!(
+        provider["current_batch_size_k"].as_u64().unwrap_or(0),
+        32,
+        "current_batch_size_k must equal initial_batch_size (32) before any AIMD adjustment"
+    );
+    assert_eq!(
+        provider["in_flight_batches"].as_u64().unwrap_or(999),
+        0,
+        "in_flight_batches must be 0 when no flushes are in flight"
+    );
+    assert_eq!(
+        provider["recent_429_rate"].as_f64().unwrap_or(1.0),
+        0.0,
+        "recent_429_rate must be 0.0 before any 429s are received"
+    );
+
+    // All pre-existing health fields must still be present.
+    assert!(provider.get("status").is_some(), "existing field 'status' must be preserved");
+    assert!(provider.get("p50_ms").is_some(), "existing field 'p50_ms' must be preserved");
+    assert!(provider.get("error_rate").is_some(), "existing field 'error_rate' must be preserved");
+    assert!(provider.get("availability").is_some(), "existing field 'availability' must be preserved");
 }
 
 /// DELETE /admin/providers/{name} for a name that does not exist returns 404.

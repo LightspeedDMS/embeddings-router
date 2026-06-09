@@ -16,7 +16,7 @@ use emr::{
     config::Config,
     db::{generate_api_key, Database},
     health::HealthTracker,
-    mux::run_multiplexer,
+    mux::{adaptive_snapshot::new_shared_snapshot, run_multiplexer},
     provider::{registry::ProviderRegistry, EmbeddingBatch, EmbeddingProvider},
     retry::BackoffConfig,
     server::{create_router, AppState},
@@ -97,7 +97,8 @@ async fn start_embedding_test_server() -> (String, String) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10));
+    let adaptive_snapshot = new_shared_snapshot();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10, adaptive_snapshot.clone()));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -107,6 +108,7 @@ async fn start_embedding_test_server() -> (String, String) {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
 
     let router = create_router(state);
@@ -431,7 +433,8 @@ async fn start_multi_provider_test_server() -> (String, String) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10));
+    let adaptive_snapshot = new_shared_snapshot();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10, adaptive_snapshot.clone()));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -441,6 +444,7 @@ async fn start_multi_provider_test_server() -> (String, String) {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
 
     let router = create_router(state);
@@ -695,7 +699,8 @@ async fn start_rate_limited_test_server() -> (String, String) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10));
+    let adaptive_snapshot = new_shared_snapshot();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10, adaptive_snapshot.clone()));
 
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
@@ -705,6 +710,7 @@ async fn start_rate_limited_test_server() -> (String, String) {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
 
     let router = create_router(state);

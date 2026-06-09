@@ -9,7 +9,7 @@ use emr::{
     config::Config,
     db::Database,
     health::HealthTracker,
-    mux::run_multiplexer,
+    mux::{adaptive_snapshot::new_shared_snapshot, run_multiplexer},
     provider::registry::ProviderRegistry,
     retry::BackoffConfig,
     server::{create_router, AppState},
@@ -29,7 +29,8 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         cumulative_cap: Duration::from_millis(1),
     };
     let health_tracker = HealthTracker::with_defaults();
-    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10));
+    let adaptive_snapshot = new_shared_snapshot();
+    tokio::spawn(run_multiplexer(mux_rx, providers_arc.clone(), 10, no_retry, health_tracker.clone(), Duration::from_secs(30), 32, 10, adaptive_snapshot.clone()));
     let state = AppState {
         db: Arc::new(Mutex::new(db)),
         config: Arc::new(Config::default()),
@@ -38,6 +39,7 @@ async fn start_test_server() -> (String, tokio::task::JoinHandle<()>) {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
     let router = create_router(state);
 

@@ -193,6 +193,23 @@ enum ProvidersCommands {
         #[arg(long)]
         admin_secret: Option<String>,
     },
+    /// Probe provider latency as a function of batch size
+    Probe {
+        /// Provider name to probe
+        name: String,
+        /// Server base URL
+        #[arg(long, default_value = "http://localhost:3200")]
+        server: String,
+        /// Admin secret (or set EMR_ADMIN_SECRET, or create ~/.config/emr/.env)
+        #[arg(long)]
+        admin_secret: Option<String>,
+        /// Caller API key for /v1/embeddings requests
+        #[arg(long)]
+        api_key: String,
+        /// Number of sample requests per batch size
+        #[arg(long, default_value = "3")]
+        samples: u32,
+    },
 }
 
 // ── Config subcommands ───────────────────────────────────────────────────────
@@ -310,6 +327,7 @@ async fn dispatch_keys(command: KeysCommands) -> Result<(), error::ConfigError> 
 }
 
 async fn dispatch_providers(command: ProvidersCommands) -> Result<(), error::ConfigError> {
+    use emr::cli::probe::cmd_providers_probe;
     use emr::cli::providers::{
         cmd_providers_add, cmd_providers_list, cmd_providers_remove, cmd_providers_test,
     };
@@ -338,6 +356,10 @@ async fn dispatch_providers(command: ProvidersCommands) -> Result<(), error::Con
         ProvidersCommands::Test { name, server, admin_secret } => {
             let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
             cmd_providers_test(&server, &secret, &name).await
+        }
+        ProvidersCommands::Probe { name, server, admin_secret, api_key, samples } => {
+            let secret = resolve_admin_secret(admin_secret.as_deref(), &default_env_path())?;
+            cmd_providers_probe(&server, &secret, &api_key, &name, samples).await
         }
     }
 }

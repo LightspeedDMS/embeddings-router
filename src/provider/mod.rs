@@ -34,6 +34,17 @@ impl ProviderType {
             ProviderType::Cohere => "cohere",
         }
     }
+
+    /// Maximum texts per request for this provider type.
+    ///
+    /// These limits match the values returned by each provider's
+    /// `EmbeddingProvider::max_texts_per_request()` implementation.
+    pub fn max_texts_per_request(&self) -> usize {
+        match self {
+            ProviderType::Voyage => 128,
+            ProviderType::Cohere => 96,
+        }
+    }
 }
 
 impl std::str::FromStr for ProviderType {

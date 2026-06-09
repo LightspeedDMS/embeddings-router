@@ -111,6 +111,7 @@ All keys commands accept `--server <url>` and `--admin-secret <secret>` (or read
 | `emr providers list` | List all registered providers |
 | `emr providers remove <name>` | Remove a provider |
 | `emr providers test <name>` | Health-probe a provider (real API call) |
+| `emr providers probe <name>` | Batch size calibration — sends real requests at geometric sizes (1,2,4,...,256), reports latency per batch size |
 
 ### Configuration
 
@@ -270,7 +271,10 @@ Per-provider health metrics.
     "health_score": 0.95,
     "sinbinned": false,
     "total_requests": 5000,
-    "total_failures": 50
+    "total_failures": 50,
+    "current_batch_size_k": 32,
+    "in_flight_batches": 2,
+    "recent_429_rate": 0.01
   }
 ]
 ```
@@ -575,6 +579,77 @@ These are **per-batch** latencies (one provider API call serving up to 128 texts
 - **503 backpressure** is intentional. When the provider can't keep up, the router signals callers to back off rather than queuing unboundedly.
 - **Throughput plateau** around 200 concurrent reflects the provider's processing capacity, not the router's. The router itself handles thousands of concurrent connections.
 - **Voyage vs Cohere** difference is provider-side: Voyage enforces stricter rate limits, Cohere does not (at these volumes).
+
+### Adaptive Parallel Batching (Epic #14)
+
+Epic #14 introduced AIMD-based adaptive batch sizing. The multiplexer now adjusts the flush threshold K per provider using Additive Increase / Multiplicative Decrease:
+- **Terminal 429**: K doubles (more aggressive batching to reduce API calls)
+- **Consecutive successes**: K decreases by 1 (finds the optimal operating point)
+
+This is observable via `GET /health/providers` (`current_batch_size_k`, `in_flight_batches`, `recent_429_rate`) and the `emr providers probe <name>` CLI command.
+
+#### Sustained Load: Voyage AI (10,000 requests, Poisson-like jitter, 100 concurrent)
+
+Realistic sustained load — not burst injection. Requests arrive with random micro-jitter (0-3ms between launches) creating Poisson-like arrival patterns.
+
+| Metric | Adaptive (current) | Baseline (pre-Epic #14) | Delta |
+|--------|-------------------|------------------------|-------|
+| Success rate | 99.3% (9,933/10K) | 100% (10K/10K) | -0.7% |
+| 429 responses | 67 | 0 | +67 |
+| p50 latency | 188ms | 430ms | **-56%** |
+| p95 latency | 430ms | 1,213ms | **-65%** |
+| p99 latency | 6,641ms | 8,263ms | -20% |
+| Mean latency | 310ms | 653ms | **-53%** |
+| Throughput | 104.6 req/s | 90.9 req/s | **+15%** |
+| Wall clock | 95s | 110s | -14% |
+
+**Analysis**: Adaptive batching trades a small 429 spike (67 requests, <1%) for dramatically lower latency across the board. The AIMD algorithm initially over-batches, triggers a brief 429 storm around t+67-69s, then converges to the optimal K within seconds. Baseline never finds this optimum — it operates at a fixed batch size that is conservative but consistently slower.
+
+#### Sustained Load: Cohere (10,000 requests, Poisson-like jitter, 100 concurrent)
+
+| Metric | Value |
+|--------|-------|
+| Success rate | 79.0% (7,900/10K) |
+| 429 responses | 2,100 |
+| p50 latency | 135ms |
+| p95 latency | 566ms |
+| p99 latency | 1,158ms |
+| Mean latency | 180ms |
+| Throughput | 79.0 req/s |
+| Wall clock | 100s |
+
+**Analysis**: Cohere enforces stricter rate limits than Voyage at sustained load. The AIMD algorithm responds correctly — K doubles on each 429 storm, then slowly decreases during recovery. The 429 wall hits around t+32-60s, with full recovery by t+77s. When not rate-limited, Cohere is the fastest provider (p50=135ms vs Voyage's 188ms).
+
+#### Sustained Load: Dual-Provider (Voyage + Cohere, policy=all, 10K requests)
+
+Both providers requested per call with `policy: "all"` — the request only succeeds if both Voyage and Cohere return embeddings.
+
+| Metric | Value |
+|--------|-------|
+| Success rate | 83.9% (8,394/10K) |
+| 429 responses | 0 |
+| Other errors | 1,606 |
+| p50 latency | 210ms |
+| p95 latency | 1,757ms |
+| p99 latency | 5,498ms |
+| Mean latency | 547ms |
+| Throughput | 73.0 req/s |
+| Wall clock | 115s |
+
+**Analysis**: With `policy=all`, the slower/stricter provider dominates. Zero 429s appear because the router returns multi-provider failure (502) when Cohere rate-limits, not a pass-through 429. The error storm at t+48-66s corresponds to Cohere's rate-limit period. Latency follows a three-phase pattern: warm-up (5-6s, AIMD finding K), steady state (~200ms, t+27-47s), Cohere storm (t+48-66s), recovery and convergence (~175ms, t+91+).
+
+**Recommendation**: Use `policy=any` for latency-sensitive workloads — it returns whichever provider responds first and only fails if all providers fail.
+
+#### Test Methodology
+
+All sustained load tests use `scripts/sustained_load_test.sh`:
+- 10,000 total requests with 100 max concurrent workers
+- FIFO-based semaphore for concurrency limiting
+- Micro-jitter: random 0-3ms between request launches (Poisson-like arrival)
+- Each request sends 1 unique text for embedding
+- Metrics: per-request HTTP status code and latency, aggregated into percentiles and 1-second time-series buckets
+- Server: localhost:3200 (single instance, release build)
+- Baseline commit: `9a906e9` (pre-Epic #14, fixed batch sizing)
 
 ## Environment Variables
 

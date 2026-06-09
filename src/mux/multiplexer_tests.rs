@@ -11,12 +11,18 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ProviderError;
 use crate::health::HealthTracker;
+use crate::mux::adaptive_snapshot::{new_shared_snapshot, SharedAdaptiveSnapshot};
 use crate::mux::multiplexer::run_multiplexer;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
 use crate::provider::registry::ProviderRegistry;
 use crate::provider::{EmbeddingBatch, EmbeddingProvider};
 use crate::retry::BackoffConfig;
+
+/// Create a fresh no-op adaptive snapshot for use in tests.
+fn test_snapshot() -> SharedAdaptiveSnapshot {
+    new_shared_snapshot()
+}
 
 // ── Test providers ─────────────────────────────────────────────────────────────
 
@@ -190,7 +196,7 @@ async fn send_req(
 async fn test_multiplexer_single_caller_gets_result() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -211,7 +217,7 @@ async fn test_multiplexer_single_caller_gets_result() {
 async fn test_multiplexer_demux_correct_slice() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -249,7 +255,7 @@ async fn test_multiplexer_capacity_flush() {
     let registry = build_registry(3);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window — only capacity flush should trigger.
-    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -269,7 +275,7 @@ async fn test_multiplexer_graceful_shutdown() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // Very long window so only shutdown triggers the flush.
-    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    let handle = tokio::spawn(run_multiplexer(rx, registry, 60_000, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let (resp_tx, resp_rx) = oneshot::channel();
     tx.send(MuxRequest {
@@ -328,7 +334,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
     // 20ms window — well within the test timeout.
-    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 20, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let handles: Vec<_> = (0..3)
         .map(|i| {
@@ -356,7 +362,7 @@ async fn test_multiplexer_timer_flush_all_callers_served() {
 async fn test_multiplexer_multi_provider_any() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -379,7 +385,7 @@ async fn test_multiplexer_multi_provider_any() {
 async fn test_multiplexer_multi_provider_all_one_fails() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -415,7 +421,7 @@ async fn test_multiplexer_multi_provider_all_one_fails() {
 async fn test_multiplexer_provider_failure_in_failed_map() {
     let registry = build_multi_registry();
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -439,7 +445,7 @@ async fn test_multiplexer_provider_failure_in_failed_map() {
 async fn test_multiplexer_batch_sub_requests_same_mux() {
     let registry = build_registry(128);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let (r1, r2) = tokio::join!(
         send_req(
@@ -468,7 +474,7 @@ async fn test_multiplexer_overflow_splits_correctly() {
     // Max 2 texts; first caller takes 2 → slot full → second goes to new slot.
     let registry = build_registry(2);
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 50, no_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let r1 = send_req(
         &tx,
@@ -525,7 +531,7 @@ async fn build_sinbin_registry_and_tracker() -> (Arc<ProviderRegistry>, HealthTr
 async fn test_sinbinned_provider_skipped_for_any_policy() {
     let (registry, tracker) = build_sinbin_registry_and_tracker().await;
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -555,7 +561,7 @@ async fn test_sinbinned_provider_skipped_for_any_policy() {
 async fn test_sinbinned_provider_still_attempted_for_all_policy() {
     let (registry, tracker) = build_sinbin_registry_and_tracker().await;
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -606,7 +612,7 @@ async fn test_all_providers_sinbinned_any_policy_still_attempts() {
     let registry = Arc::new(reg);
 
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, no_retry_config(), tracker, Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,
@@ -663,7 +669,6 @@ impl EmbeddingProvider for Always429Provider {
 /// adaptive_k for "429-p" must become 64.
 #[tokio::test]
 async fn test_flush_outcome_terminal_429_doubles_adaptive_k() {
-    use crate::mux::multiplexer::MuxState;
     use std::time::Duration;
 
     let provider_name = "429-p".to_string();
@@ -685,6 +690,7 @@ async fn test_flush_outcome_terminal_429_doubles_adaptive_k() {
         Duration::from_secs(30),
         32,  // initial_batch_size = K initial
         10,  // success_streak_threshold
+        test_snapshot(),
     ));
 
     // Send a request — it will trigger a flush that returns terminal 429
@@ -739,6 +745,7 @@ async fn test_flush_outcome_non_429_error_no_adaptive_change() {
         Duration::from_secs(30),
         32,
         10,
+        test_snapshot(),
     ));
 
     let result = send_req(
@@ -787,6 +794,7 @@ async fn test_add_to_slot_uses_adaptive_k() {
         Duration::from_secs(30),
         32,  // initial K
         10,
+        test_snapshot(),
     ));
 
     // Send to voyage → triggers terminal 429 → voyage K should be doubled to 64
@@ -876,6 +884,7 @@ async fn test_multiplexer_flush_is_nonblocking() {
         Duration::from_secs(30),
         1,                // initial_batch_size = 1 (flush immediately)
         10,
+        test_snapshot(),
     ));
 
     // Send first request — triggers capacity flush (spawned task takes 100ms)
@@ -932,6 +941,7 @@ async fn test_multiplexer_parallel_flushes_same_provider() {
         Duration::from_secs(30),
         1, // flush_threshold = 1
         10,
+        test_snapshot(),
     ));
 
     // Send two requests concurrently — each should trigger its own flush task.
@@ -969,6 +979,7 @@ async fn test_multiplexer_graceful_shutdown_drains_joinset() {
         Duration::from_secs(30),
         1,
         10,
+        test_snapshot(),
     ));
 
     // Send a request that triggers an in-flight task.
@@ -1018,6 +1029,7 @@ async fn test_multiplexer_flush_threshold_triggers_at_k() {
         Duration::from_secs(30),
         4, // initial_batch_size = 4
         10,
+        test_snapshot(),
     ));
 
     // Send exactly 4 texts in one call — should trigger flush immediately.
@@ -1048,7 +1060,7 @@ async fn test_multiplexer_retries_on_rate_limited() {
     let registry = Arc::new(reg);
 
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10));
+    tokio::spawn(run_multiplexer(rx, registry, 10, one_retry_config(), HealthTracker::with_defaults(), Duration::from_secs(30), 128, 10, test_snapshot()));
 
     let result = send_req(
         &tx,

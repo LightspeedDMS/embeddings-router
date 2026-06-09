@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use crate::health::HealthTracker;
 use crate::mux::accumulator::BatchAccumulator;
 use crate::mux::adaptive::AdaptiveKRegistry;
+use crate::mux::adaptive_snapshot::SharedAdaptiveSnapshot;
 use crate::mux::policy::RoutingPolicy;
 use crate::mux::{MuxError, MuxRequest, MuxResponse};
 use crate::provider::registry::ProviderRegistry;
@@ -74,9 +75,12 @@ pub(crate) struct MuxState {
     pub(crate) flush_tasks: JoinSet<FlushOutcome>,
     /// Per-provider adaptive K registry (AIMD feedback).
     pub(crate) adaptive_k: AdaptiveKRegistry,
+    /// Shared observability snapshot — written after each flush outcome, read by health handlers.
+    pub(crate) adaptive_snapshot: SharedAdaptiveSnapshot,
 }
 
 impl MuxState {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         batch_window: Duration,
         providers: Arc<ProviderRegistry>,
@@ -85,6 +89,7 @@ impl MuxState {
         recovery_probe_interval: Duration,
         initial_batch_size: usize,
         success_streak_threshold: u32,
+        adaptive_snapshot: SharedAdaptiveSnapshot,
     ) -> Self {
         Self {
             slots: HashMap::new(),
@@ -96,6 +101,7 @@ impl MuxState {
             recovery_probe_interval,
             flush_tasks: JoinSet::new(),
             adaptive_k: AdaptiveKRegistry::new(initial_batch_size, success_streak_threshold),
+            adaptive_snapshot,
         }
     }
 
@@ -134,6 +140,7 @@ pub async fn run_multiplexer(
     recovery_probe_interval: Duration,
     initial_batch_size: usize,
     success_streak_threshold: u32,
+    adaptive_snapshot: SharedAdaptiveSnapshot,
 ) {
     let batch_window = Duration::from_millis(batch_window_ms);
     let retry_config = Arc::new(retry_config);
@@ -145,6 +152,7 @@ pub async fn run_multiplexer(
         recovery_probe_interval,
         initial_batch_size,
         success_streak_threshold,
+        adaptive_snapshot,
     );
 
     loop {
@@ -303,6 +311,30 @@ pub(crate) async fn handle_flush_outcome(outcome: FlushOutcome, state: &mut MuxS
                 adaptive_state.write().unwrap().record_terminal_429(hard_max);
             }
             Err(_) => {} // Non-429 error: no K adjustment, no streak reset
+        }
+
+        // Update observability snapshot with current adaptive state.
+        // recent_429_rate: 1.0 if the last flush was a terminal 429, 0.0 otherwise.
+        // This is a simple per-flush rate (not a rolling window) — sufficient for
+        // basic health observability without the complexity of a ring buffer.
+        let (current_k, recent_429_rate) = {
+            let guard = adaptive_state.read().unwrap();
+            let rate = if matches!(&result, Err(ProviderError::RateLimited { .. })) {
+                1.0_f64
+            } else {
+                0.0_f64
+            };
+            (guard.current_k, rate)
+        };
+        if let Ok(mut snap) = state.adaptive_snapshot.write() {
+            snap.update(
+                &provider_name,
+                crate::mux::adaptive_snapshot::ProviderAdaptiveState {
+                    current_batch_size_k: current_k,
+                    in_flight_batches: state.flush_tasks.len(),
+                    recent_429_rate,
+                },
+            );
         }
     }
 

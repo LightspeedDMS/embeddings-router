@@ -3,6 +3,7 @@ pub mod down;
 pub mod env;
 pub mod health_cmd;
 pub mod keys;
+pub mod probe;
 pub mod providers;
 pub mod serve;
 pub mod status;

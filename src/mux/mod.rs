@@ -1,5 +1,6 @@
 pub mod accumulator;
 pub mod adaptive;
+pub mod adaptive_snapshot;
 pub mod multiplexer;
 pub mod policy;
 

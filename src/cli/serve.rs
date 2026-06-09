@@ -9,10 +9,10 @@ use crate::{
     db::Database,
     error::ConfigError,
     health::HealthTracker,
+    mux::{adaptive_snapshot::new_shared_snapshot, run_multiplexer},
     provider::registry::ProviderRegistry,
     retry::BackoffConfig,
     server::{create_router, AppState},
-    mux::run_multiplexer,
 };
 
 /// Execute `emr serve` — start the HTTP server.
@@ -109,6 +109,8 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         config.health.sinbin_multiplier,
     );
 
+    let adaptive_snapshot = new_shared_snapshot();
+
     tokio::spawn(run_multiplexer(
         mux_rx,
         providers_arc.clone(),
@@ -118,6 +120,7 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         Duration::from_secs(config.health.recovery_probe_interval_seconds),
         config.multiplexer.initial_batch_size,
         config.multiplexer.success_streak_threshold,
+        adaptive_snapshot.clone(),
     ));
 
     let state = AppState {
@@ -128,6 +131,7 @@ pub async fn cmd_serve() -> Result<(), ConfigError> {
         start_time: std::time::Instant::now(),
         mux_tx,
         health_tracker,
+        adaptive_snapshot,
     };
 
     let app = create_router(state);

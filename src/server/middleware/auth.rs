@@ -173,6 +173,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             mux_tx,
             health_tracker: HealthTracker::with_defaults(),
+            adaptive_snapshot: crate::mux::adaptive_snapshot::new_shared_snapshot(),
         };
         Router::new()
             .route("/admin/test", get(protected_handler))

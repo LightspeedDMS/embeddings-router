@@ -126,6 +126,9 @@ pub async fn list_providers(
             let responses: Vec<serde_json::Value> = records
                 .into_iter()
                 .map(|r| {
+                    let max_texts = ProviderType::from_str(&r.provider_type)
+                        .map(|pt| pt.max_texts_per_request())
+                        .unwrap_or(128);
                     serde_json::json!({
                         "name": r.name,
                         "provider_type": r.provider_type,
@@ -134,6 +137,7 @@ pub async fn list_providers(
                         "model": r.model,
                         "enabled": r.enabled,
                         "created_at": r.created_at,
+                        "max_texts_per_request": max_texts,
                     })
                 })
                 .collect();
